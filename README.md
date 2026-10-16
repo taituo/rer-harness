@@ -2,6 +2,10 @@
 
 Runs a Reverse Eureka Reconstruction study on [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable), unattended: a doer model walks a frozen question path toward a solution it is never told about, two observers follow and discuss, a control arm gets the same treatment without the path, and every step lands in one SQLite file per run that can be published as the raw record.
 
+![The live view during a test run: the researcher on the left, blind observer B and informed observer A on the right, each with a message box](docs/live-view.png)
+
+*This is the live view during a test run with fake models: the researcher on the left with its tool calls and step markers, blind observer B in the middle (with a human question it was sent and the `human-contact` marker that recorded it), informed observer A on the right, each observer reading the researcher's transcript with its own tools, and a message box under every column.*
+
 The code is `rer.ts` and `live.html`. Everything the models read lives in `study/` as Markdown plus one JSON config.
 
 ## Run the whole study
@@ -10,7 +14,7 @@ The code is `rer.ts` and `live.html`. Everything the models read lives in `study
 npm install                                # exact versions pinned
 node rer.ts design study/experiment.json   # optional: designer drafts the path from target.md
 #   write questions.md and control.md (same voice, same length; control has no path)
-node rer.ts freeze study/experiment.json   # then commit freeze.json
+node rer.ts freeze study/experiment.json   # then commit study/experiment.freeze.json
 nohup node rer.ts auto study/experiment.json > runs/auto.log 2>&1 &
 ```
 
@@ -22,9 +26,25 @@ nohup node rer.ts auto study/experiment.json > runs/auto.log 2>&1 &
 4. A crash, a killed process or a reboot loses nothing: the supervisor restarts the worker with growing backoff, finished runs are skipped, and an unfinished run continues from its last step (every submission has a request id, so nothing is asked twice). Each restart is visible in the record as a new `rer.session` entry.
 5. It stops for good on anything a restart cannot fix: files changed since freeze, isolation failed, missing credentials, a model changed mid-run. That is exit code 3 and a notification.
 
-Per-run budget (`budget.maxUsd`) is checked every two seconds while the doer works, not just between steps; crossing it aborts the doer and ends the run, recorded as such. Cost is computed from token counts and catalog prices, not from what a provider reports.
+Per-run budget (`budget.maxUsd` and/or `budget.maxTokens`) is checked every two seconds while the doer works, not just between steps; crossing it aborts the doer and ends the run, recorded as such. Cost is computed from token counts and catalog prices, not from what a provider reports.
 
 `--faux` runs the whole thing offline with fake models, to check a study before paying for it.
+
+## OpenCode Go
+
+An OpenCode Go subscription works through Pi's built-in `opencode-go` provider: set `OPENCODE_API_KEY` and use model strings like `opencode-go/kimi-k3`. `study/experiment.opencode-go.json` is the same study on Go models (Kimi K3 as the researcher, GLM 5.3 and DeepSeek V4 Pro as observers from different families, Grok 4.7 as designer).
+
+```bash
+node rer.ts models study/experiment.opencode-go.json --provider opencode-go   # what Go offers, and is your key found
+```
+
+Under a subscription the dollar prices in the catalog are list prices, not what you pay, so cap each run with `budget.maxTokens` instead of `maxUsd` (both can be set; either one stops the run). Each config gets its own freeze file, so the Anthropic and Go versions of one study can sit side by side.
+
+## Let an agent run it
+
+`.agents/skills/rer-study/SKILL.md` is a skill that teaches an agent to operate a study end to end: set up, check the path for leaks, freeze, start, watch, steer, and read the results, with the rules that keep the experiment valid. OpenCode picks it up from `.agents/skills/`, Claude Code from `.claude/skills/` (a link to the same folder), and any agent that reads Agent Skills can use it.
+
+`.opencode/agents/rer-operator.md` is an OpenCode agent built around that skill: start `opencode`, switch to the `rer-operator` agent, and ask it to run the study or how it is going.
 
 ## Watch it live
 
@@ -81,7 +101,7 @@ The two observer-facing strings in the code (how a step is handed over, how the 
 
 ## Single commands
 
-`node rer.ts run|export <config> --arm rer --run 1`, `node rer.ts guess <config> --arm rer`. With `sandbox.start` set, `run` starts the container itself.
+`node rer.ts run|export <config> --arm rer --run 1`, `node rer.ts guess <config> --arm rer`, `node rer.ts models <config> [--provider P]`. With `sandbox.start` set, `run` starts the container itself.
 
 ## Isolation
 

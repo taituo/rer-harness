@@ -6,6 +6,7 @@
 //   node rer.ts guess   <config> [--arm X]  leakage test: tool-less guessers see questions 1..k
 //   node rer.ts run     <config> [--arm X] [--run N]   one run: doer walks the path, observers follow
 //   node rer.ts export  <config> [--arm X] [--run N]   transcripts to markdown
+//   node rer.ts models  <config> [--provider P]   which models exist and have credentials
 //
 // Flags: --faux (offline dry run with a fake model), --unfrozen (allow edits after freeze; recorded),
 //        --allow-leaks (run even if the isolation canary fails; recorded).
@@ -55,7 +56,7 @@ type Config = {
 	blindSeesInformed?: boolean; // default false: blind observers never see what informed ones say
 	designer?: Role;
 	guessers?: { models: string[]; thinking?: string; cutoffs: number[]; repeats: number; prompt: string; shuffled?: boolean };
-	budget?: { maxUsd?: number }; // per run
+	budget?: { maxUsd?: number; maxTokens?: number }; // per run; maxTokens suits subscriptions (OpenCode Go) where dollars do not apply
 	modelRetries?: number; // provider retries inside one model call (no new message to the model)
 	retries?: number; // resubmissions after a call still failed; each is recorded
 	inbox?: string;
@@ -72,10 +73,10 @@ const opt = (name: string, fallback: string) => {
 	const i = args.indexOf(`--${name}`);
 	return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 };
-const valued = new Set(["--arm", "--run"]);
+const valued = new Set(["--arm", "--run", "--provider"]);
 const [command, configArg] = args.filter((a, i) => !a.startsWith("--") && !valued.has(args[i - 1]));
 if (!command || !configArg) {
-	console.error("usage: node rer.ts <auto|design|freeze|guess|run|export> <config.json> [--arm rer] [--run 1] [--faux]");
+	console.error("usage: node rer.ts <auto|design|freeze|guess|run|export|models> <config.json> [--arm rer] [--run 1] [--provider opencode-go] [--faux]");
 	process.exit(2);
 }
 const configPath = resolve(configArg);
@@ -396,6 +397,11 @@ async function costUsd(harness: Harness) {
 	return total;
 }
 
+async function tokensUsed(harness: Harness) {
+	const u: any = await harness.usage(ctx);
+	return Object.values(u.models ?? {}).reduce((n: number, v: any) => n + (v?.totalTokens ?? 0), 0) as number;
+}
+
 /** Fail before starting, not after retries: every model must exist in the catalog and have credentials. */
 async function preflight(roles: string[]) {
 	if (faux) return;
@@ -556,9 +562,12 @@ const versions = () =>
 		}
 	}));
 
+/** One freeze file per config, so two configs over the same study files (say Anthropic and OpenCode Go) do not clash. */
+const freezeFile = () => join(base, `${basename(configPath, ".json")}.freeze.json`);
+
 function checkFrozen(): { frozen: boolean; diff: string[] } {
-	const f = at("freeze.json");
-	if (!existsSync(f)) return { frozen: false, diff: ["freeze.json missing"] };
+	const f = freezeFile();
+	if (!existsSync(f)) return { frozen: false, diff: [`${basename(f)} missing`] };
 	const frozen = JSON.parse(readFileSync(f, "utf8")).files as Record<string, string>;
 	const now = fingerprint();
 	const diff = [...new Set([...Object.keys(frozen), ...Object.keys(now)])].filter((k) => frozen[k] !== now[k]);
@@ -581,8 +590,8 @@ async function design() {
 
 function freeze() {
 	const record = { frozenAt: new Date().toISOString(), versions: versions(), files: fingerprint() };
-	writeFileSync(at("freeze.json"), JSON.stringify(record, null, 2) + "\n");
-	console.log(`froze ${Object.keys(record.files).length} files into freeze.json; commit it before running:`);
+	writeFileSync(freezeFile(), JSON.stringify(record, null, 2) + "\n");
+	console.log(`froze ${Object.keys(record.files).length} files into ${relative(process.cwd(), freezeFile())}; commit it before running:`);
 	for (const [f, h] of Object.entries(record.files)) console.log(`  ${h.slice(0, 12)}  ${f}`);
 }
 
@@ -733,10 +742,13 @@ async function run(arm: string, runNo: string) {
 	};
 	const budget = async () => {
 		const spent = await costUsd(harness);
-		setStatus({ usd: Number(spent.toFixed(4)) });
-		if (cfg.budget?.maxUsd && spent >= cfg.budget.maxUsd) {
+		const tokens = await tokensUsed(harness);
+		setStatus({ usd: Number(spent.toFixed(4)), tokens });
+		const over = cfg.budget?.maxUsd && spent >= cfg.budget.maxUsd ? `$${spent.toFixed(2)} of $${cfg.budget.maxUsd}`
+			: cfg.budget?.maxTokens && tokens >= cfg.budget.maxTokens ? `${tokens} of ${cfg.budget.maxTokens} tokens` : undefined;
+		if (over) {
 			await doer.abort(ctx);
-			throw new BudgetReached(`budget reached ($${spent.toFixed(2)} of $${cfg.budget.maxUsd})`);
+			throw new BudgetReached(`budget reached (${over})`);
 		}
 	};
 	const stopLive = startLive(harness, { doer, ...Object.fromEntries(observers.map(({ o, c }) => [`observer:${o.name}`, c])) }, say);
@@ -853,7 +865,32 @@ async function supervise() {
 	}
 }
 
+/** Which models exist and which have credentials: every model the config uses, then a provider's catalog (--provider). */
+async function listModels() {
+	const used = [cfg.doer, cfg.designer, ...(cfg.observers ?? [])].filter(Boolean).map((r) => r!.model).concat(cfg.guessers?.models ?? []);
+	const authed = new Map<string, boolean>();
+	const hasAuth = async (p: string) => {
+		if (!authed.has(p)) authed.set(p, !!(await models.getAuth(p).catch(() => undefined)));
+		return authed.get(p)!;
+	};
+	console.log("models in this config:");
+	for (const m of [...new Set(used)]) {
+		const i = m.indexOf("/");
+		const found = models.getModel(m.slice(0, i), m.slice(i + 1));
+		console.log(`  ${found ? "ok     " : "UNKNOWN"} ${(await hasAuth(m.slice(0, i))) ? "key ok " : "NO KEY "} ${m}`);
+	}
+	const provider = opt("provider", "");
+	if (provider) {
+		console.log(`\n${provider} catalog (${(await hasAuth(provider)) ? "credentials found" : "no credentials"}):`);
+		for (const m of models.getModels(provider)) {
+			const c: any = (m as any).cost ?? {};
+			console.log(`  ${provider}/${m.id}  ctx ${(m as any).contextWindow ?? "?"}  $${c.input ?? "?"}/$${c.output ?? "?"} per Mtok${(m as any).reasoning ? "  reasoning" : ""}`);
+		}
+	}
+}
+
 const commands: Record<string, () => unknown> = {
+	models: listModels,
 	auto: () => (flag("worker") ? autoWorker() : supervise()),
 	design,
 	freeze,

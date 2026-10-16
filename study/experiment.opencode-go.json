@@ -1,0 +1,92 @@
+{
+  "name": "handwired",
+  "runsDir": "../runs",
+  "arms": {
+    "rer": "questions.md",
+    "control": "control.md"
+  },
+  "pushes": "pushes.md",
+  "autoPushes": [],
+  "afterPath": [
+    "open-1",
+    "open-2",
+    "open-3"
+  ],
+  "target": "target.md",
+  "workdir": "/srv/work",
+  "sandbox": {
+    "start": "../sandbox/start.sh",
+    "shell": "../sandbox/shell.sh",
+    "container": "rer-sandbox",
+    "forbiddenPaths": []
+  },
+  "doer": {
+    "model": "opencode-go/kimi-k3",
+    "thinking": "xhigh",
+    "instructions": "doer.md"
+  },
+  "observers": [
+    {
+      "name": "A",
+      "model": "opencode-go/glm-5.3",
+      "thinking": "high",
+      "informed": true,
+      "instructions": "observer.md"
+    },
+    {
+      "name": "B",
+      "model": "opencode-go/deepseek-v4-pro",
+      "thinking": "high",
+      "informed": false,
+      "instructions": "observer.md"
+    }
+  ],
+  "observerRounds": 1,
+  "designer": {
+    "model": "opencode-go/grok-4.7",
+    "thinking": "xhigh",
+    "instructions": "designer.md"
+  },
+  "guessers": {
+    "models": [
+      "opencode-go/qwen3.8-max",
+      "opencode-go/gpt-6-luna"
+    ],
+    "thinking": "high",
+    "cutoffs": [
+      3,
+      6,
+      9,
+      11,
+      15,
+      20
+    ],
+    "repeats": 5,
+    "prompt": "guess.md",
+    "shuffled": true
+  },
+  "budget": {
+    "maxTokens": 20000000
+  },
+  "retries": 2,
+  "digest": {
+    "maxToolChars": 4000,
+    "maxChars": 60000,
+    "includeThinking": false
+  },
+  "observerTools": true,
+  "auto": {
+    "runs": 3,
+    "arms": [
+      "rer",
+      "control"
+    ],
+    "guess": true,
+    "maxRestarts": 50
+  },
+  "live": {
+    "port": 7777,
+    "host": "127.0.0.1"
+  },
+  "notify": ""
+}
