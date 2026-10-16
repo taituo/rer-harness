@@ -41,7 +41,7 @@ node rer.ts judge study/experiment.json --unblind        # means per arm, spread
 
 Each run's export also has `summary.json` (ending, stalls, retries, restarts, interventions, network, warnings, cost), `ledger.csv` (the observers' idea ledger with the path release point in the summary), and `files.json` (every file the doer left, with hashes).
 
-With an `evaluator` configured, `auto` ends with `node rer.ts evaluate`: frozen hidden acceptance tests run against every run's work in a fresh offline container, never told the arm and never visible to the doer. [docs/targets.md](docs/targets.md) covers choosing targets with such tests (FastCDC first), what to keep per target, and the preparation modes.
+With an `evaluator` configured, `auto` ends with `node rer.ts evaluate`: frozen hidden acceptance tests run against every run's work in a fresh offline container, never told the arm and never visible to the doer. [targets/fastcdc/](targets/fastcdc/) is a ready pilot with such tests; [docs/targets.md](docs/targets.md) covers choosing targets with such tests (FastCDC first), what to keep per target, and the preparation modes.
 
 **[docs/study-design.md](docs/study-design.md)** shows how to build a study that can carry the main claim: topic-matched and cut-path arms, an impossible-target arm, a blind designer, stall limits, blind scoring and judging, the analysis plan, the librarian, model cutoffs, and the pilot.
 

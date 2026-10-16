@@ -1,0 +1,3 @@
+<!-- B: seen by the designer, informed observers, scorers and the informed judge. Never by the doer. -->
+
+Content-defined chunking (as in FastCDC): cut a byte stream into variable-size pieces at positions chosen from the content itself, using a rolling hash over a small window, with minimum and maximum piece sizes. Because cut points depend only on nearby bytes, an insertion or deletion changes only the pieces around it, so most pieces of an edited file are identical to pieces of the original and can be deduplicated; fixed-size pieces lose almost everything after a one-byte insert at the start.

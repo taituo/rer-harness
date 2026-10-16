@@ -29,6 +29,8 @@ reset
 core() {
 	check "type check" "[ \$(npx -y -p typescript@5 tsc --noEmit --allowImportingTsExtensions --module nodenext --target es2023 --moduleResolution nodenext --skipLibCheck --strict false rer.ts 2>&1 | grep 'error TS' | grep -v TS2352 | wc -l) -eq 0 ]"
 
+	check "FastCDC evaluator tells content-defined from fixed from broken" "targets/fastcdc/selftest.sh >/dev/null"
+
 	# Smoke: a three-arm study end to end.
 	rer freeze $CFG >/dev/null
 	timeout 600 node rer.ts auto $CFG --faux > $RUNS.auto.log 2>&1

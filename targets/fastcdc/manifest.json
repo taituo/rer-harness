@@ -1,0 +1,14 @@
+{
+  "id": "fastcdc-mini",
+  "area": "storage/deduplication",
+  "preparationMode": "source",
+  "source": { "url": "https://github.com/google/cdc-file-transfer", "commit": "<pin the exact commit you read>", "path": "fastcdc/fastcdc.h" },
+  "rights": { "licenseChecked": false, "notes": "Apache-2.0 per the repository; nothing from it is copied into the study. Verify before publishing artifacts." },
+  "binarySha256": null,
+  "target": "target.md",
+  "evaluator": "eval/",
+  "contract": "eval/evaluate.py (docstring)",
+  "holdout": "eval/private-seeds.json",
+  "references": "reference/ (evaluator self-test only: gear, fixed, broken)",
+  "budget": { "maxUsdPerRun": 25, "maxWallMinutes": 90 }
+}

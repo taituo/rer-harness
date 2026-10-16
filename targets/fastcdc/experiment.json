@@ -1,0 +1,40 @@
+{
+  "name": "fastcdc",
+  "runsDir": "../../runs",
+  "arms": {
+    "rer": "questions.md",
+    "topic": { "file": "questions.md", "cut": 1, "padTo": 9, "padPush": "continue" },
+    "control": "control.md"
+  },
+  "pushes": "pushes.md",
+  "afterPath": ["open-1", "open-2", "deliver"],
+  "target": "target.md",
+  "leakTerms": ["fastcdc", "content-defined chunking", "content defined chunking", "gear hash", "rabin fingerprint", "rsync", "lbfs"],
+  "targetPublishedAt": "2020-07-15",
+  "analysis": "analysis.md",
+  "workdir": "/srv/work",
+  "sandbox": {
+    "start": "../../sandbox/start.sh", "shell": "../../sandbox/shell.sh", "net": "../../sandbox/net.sh",
+    "container": "rer-sandbox", "forbiddenPaths": []
+  },
+  "evaluator": { "command": "../../sandbox/evaluate.sh", "dir": "eval", "timeoutMinutes": 20 },
+  "doer": { "model": "anthropic/claude-opus-5-5", "thinking": "xhigh", "instructions": "../../study/doer.md" },
+  "observers": [
+    { "name": "A", "model": "anthropic/claude-opus-5-5", "thinking": "high", "informed": true, "instructions": "../../study/observer.md" },
+    { "name": "B", "model": "openai/gpt-6-sol", "thinking": "high", "informed": false, "instructions": "../../study/observer.md" }
+  ],
+  "designer": { "model": "xai/grok-4.7", "thinking": "xhigh", "instructions": "../../study/designer.md" },
+  "guessers": {
+    "models": ["anthropic/claude-opus-5-5", "openai/gpt-6-sol"], "thinking": "high",
+    "cutoffs": [1, 2, 3, 4, 6, 9], "repeats": 3, "prompt": "../../study/guess.md", "shuffled": true,
+    "scorers": ["anthropic/claude-opus-5-5", "openai/gpt-6-sol"], "scoreRubric": "../../study/score-guess.md"
+  },
+  "judge": {
+    "blind": ["anthropic/claude-opus-5-5", "openai/gpt-6-sol"], "informed": "xai/grok-4.7", "thinking": "high",
+    "rubric": "../../study/judge.md", "distanceRubric": "../../study/judge-distance.md"
+  },
+  "budget": { "maxUsd": 25, "maxWallMinutes": 90, "stallMinutes": 20, "stallPush": "stuck" },
+  "auto": { "runs": 1, "arms": ["rer", "topic"] },
+  "live": { "port": 7777 },
+  "notify": ""
+}
