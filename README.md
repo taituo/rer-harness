@@ -41,6 +41,8 @@ node rer.ts judge study/experiment.json --unblind        # means per arm, spread
 
 Each run's export also has `summary.json` (ending, stalls, retries, restarts, interventions, network, warnings, cost), `ledger.csv` (the observers' idea ledger with the path release point in the summary), and `files.json` (every file the doer left, with hashes).
 
+With an `evaluator` configured, `auto` ends with `node rer.ts evaluate`: frozen hidden acceptance tests run against every run's work in a fresh offline container, never told the arm and never visible to the doer. [docs/targets.md](docs/targets.md) covers choosing targets with such tests (FastCDC first), what to keep per target, and the preparation modes.
+
 **[docs/study-design.md](docs/study-design.md)** shows how to build a study that can carry the main claim: topic-matched and cut-path arms, an impossible-target arm, a blind designer, stall limits, blind scoring and judging, the analysis plan, the librarian, model cutoffs, and the pilot.
 
 ## OpenCode Go
@@ -143,6 +145,10 @@ The two observer-facing strings in the code (how a step is handed over, how the 
 ## Isolation
 
 `sandbox/start.sh` starts a container with `--network none` and only the run's workdir mounted at the same path; `sandbox/shell.sh` runs the doer's commands in it. Install what the doer may need in `sandbox/Dockerfile`, since the container cannot download anything. Any other wrapper works: point `sandbox.shell` at it and the canary tells you whether it isolates.
+
+## Tests
+
+`test/ci.sh core` and `test/ci.sh docker` check the harness itself on fake models, with no API keys; GitHub Actions runs both on every push. `RER_CI_PREBUILT=1` reuses an existing `rer-sandbox` image where registries are unreachable.
 
 ## Status
 

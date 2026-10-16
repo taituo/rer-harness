@@ -1,0 +1,3 @@
+# A small stand-in for sandbox/Dockerfile in CI: the isolation checks need a shell, Python and curl, not a full toolchain.
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*

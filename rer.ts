@@ -7,6 +7,7 @@
 //   node rer.ts score-guesses  <config>   blind scorers rate every guess against the target; leakage curve per arm
 //   node rer.ts run            <config> [--arm X] [--run N]   one run: doer walks the path, observers follow
 //   node rer.ts export         <config> [--arm X] [--run N]   transcripts, idea ledger, file tree, summary
+//   node rer.ts evaluate       <config>   frozen hidden acceptance tests against each finished run's work, objectively
 //   node rer.ts judge          <config> [--unblind]   blind judges score anonymized final outputs; --unblind joins the key
 //   node rer.ts import-pilot   <config> <file> [--arm X]   keep a pilot transcript as run 0, excluded from analysis
 //   node rer.ts models         <config> [--provider P]   which models exist and have credentials
@@ -80,6 +81,10 @@ type Config = {
 		scorers?: string[]; scoreRubric?: string; leakThreshold?: number;
 	};
 	judge?: { blind: string[]; informed?: string; thinking?: string; rubric: string; distanceRubric?: string; resultFiles?: string[]; maxPacketChars?: number };
+	/** Hidden acceptance tests: a command run on the host for each finished run, with RER_WORKDIR (the doer's work,
+	 *  to be treated read-only), RER_EVAL_DIR (the frozen tests, never visible to the doer) and RER_OUT (write JSON
+	 *  metrics there). It is not told the arm. sandbox/evaluate.sh runs the tests in a fresh offline container. */
+	evaluator?: { command: string; dir?: string; timeoutMinutes?: number };
 	library?: { model: string; thinking?: string; instructions?: string; search: string; before?: string; fromStep?: string; maxResults?: number; allowUndated?: boolean };
 	budget?: { maxUsd?: number; maxTokens?: number; maxWallMinutes?: number; stallMinutes?: number; stallPush?: string }; // per run
 	modelRetries?: number; // provider retries inside one model call (no new message to the model)
@@ -206,6 +211,7 @@ if (faux) {
 	// One fake model per configured model, so per-role usage and the model-mismatch guard behave as in a real run.
 	const f = fauxProvider({ provider: "faux", models: allModels().map(fauxId).map((id) => ({ id, reasoning: true, cost: { input: usdPerMTok, output: usdPerMTok, cacheRead: 0, cacheWrite: 0 } })) as any, tokensPerSecond: Number(process.env.RER_FAUX_TPS ?? 0) || undefined });
 	let n = 0;
+	let scripted = 0; // the doer's scripted calls keep their own order, whatever the observers do
 	const respond = (context: any) => {
 		const msgs = context.messages ?? [];
 		const last = msgs[msgs.length - 1];
@@ -223,7 +229,7 @@ if (faux) {
 			const script = process.env.RER_FAUX_TOOLS ? (JSON.parse(process.env.RER_FAUX_TOOLS) as [string, any][]) : undefined;
 			const observerCalls: [string, any][] = [["transcript", { count: 3 }], ["ledger", { idea: `idea ${n}`, origin: ["question", "doer", "prior-knowledge"][n % 3], evidence: "transcript #1", status: "claimed" }], ["files", {}], ["search", { pattern: "step" }]];
 			const call: [string, any] = tools.includes("bash")
-				? (script ? script[n++ % script.length] : ["bash", { command: `echo step ${++n} && pwd && ls` }])
+				? (script ? script[scripted++ % script.length] : ["bash", { command: `echo step ${++n} && pwd && ls` }])
 				: tools.includes("transcript") ? observerCalls[n++ % observerCalls.length] : [tools[0], {}];
 			// faux-only: RER_FAUX_DUP_IDS=1 makes observers emit two parallel calls sharing one id, as some models do
 			if (process.env.RER_FAUX_DUP_IDS && !tools.includes("bash"))
@@ -306,7 +312,7 @@ function within(root: string, p: string): string | null {
 	return real && inside(realpathSync(root), real) ? real : null;
 }
 
-const forbidden = () => [base, here, ...(cfg.sandbox?.forbiddenPaths ?? []).map(at)];
+const forbidden = () => [base, here, ...(cfg.evaluator?.dir ? [at(cfg.evaluator.dir)] : []), ...(cfg.sandbox?.forbiddenPaths ?? []).map(at)];
 
 /** The doer's file tools run on the host, so they may only touch its workdir, symlinks resolved.
  *  Bash output spilled to a host temp file is the doer's own, so exactly those files are readable too. */
@@ -786,6 +792,7 @@ function studyFiles(): string[] {
 	[cfg.pushes, cfg.target, cfg.domain, cfg.analysis, cfg.doer.instructions, cfg.designer?.instructions, cfg.designer?.blindInstructions,
 		cfg.guessers?.prompt, cfg.guessers?.scoreRubric, cfg.judge?.rubric, cfg.judge?.distanceRubric, cfg.library?.instructions].forEach(add);
 	cfg.observers?.forEach((o) => add(o.instructions));
+	if (cfg.evaluator?.dir && existsSync(at(cfg.evaluator.dir))) listFiles(at(cfg.evaluator.dir)).forEach((f) => files.add(f));
 	for (const s of [cfg.sandbox?.shell, cfg.sandbox?.start, cfg.sandbox?.net]) {
 		if (!s || !existsSync(at(s))) continue;
 		const dir = dirname(at(s));
@@ -950,6 +957,10 @@ function runId(arm: string, run: string) {
 
 async function run(arm: string, runNo: string) {
 	const { id, workdir, db, doneFile } = runId(arm, runNo);
+	// The sandbox mounts the workdir at the same path, so a workdir inside the study or harness directory would put
+	// those paths inside the doer's view. Refuse it outright.
+	for (const [what, dir] of [["study", base], ["harness", here]] as const)
+		if (inside(dir, at(cfg.workdir))) throw new Fatal(`workdir ${at(cfg.workdir)} is inside the ${what} directory ${dir}; put it elsewhere (e.g. /srv/work)`);
 	const frozen = requireFrozen();
 	const warnings = await preflight([cfg.doer.model, ...(cfg.observers ?? []).map((o) => o.model), ...(cfg.library ? [cfg.library.model] : [])]);
 	mkdirSync(workdir, { recursive: true });
@@ -1302,6 +1313,56 @@ async function importPilot() {
 	await close(harness);
 }
 
+/** Objective evaluation: the frozen hidden tests run against every finished run's work. The evaluator gets the work
+ *  and the tests, not the arm; results join the arm only here, in the report. */
+async function evaluate() {
+	const ev = cfg.evaluator;
+	if (!ev) throw new Fatal("config needs evaluator");
+	requireFrozen();
+	const runs = readdirSync(at(cfg.runsDir)).filter((f) => f.endsWith(faux ? "-faux.done.json" : ".done.json") && (faux || !f.endsWith("-faux.done.json")))
+		.map((f) => JSON.parse(readFileSync(join(at(cfg.runsDir), f), "utf8"))).filter((d) => d.run !== "0" && d.arm && cfg.arms[d.arm]);
+	if (!runs.length) throw new Fatal("no finished runs to evaluate");
+	const rows: (string | number)[][] = [["arm", "run", "metric", "value"]];
+	setStatus({ phase: "evaluate" });
+	for (const r of runs) {
+		const { workdir, exportDir, id } = runId(r.arm, r.run);
+		mkdirSync(exportDir, { recursive: true });
+		const outFile = join(exportDir, "evaluation.json");
+		const cached = existsSync(outFile) && !/"error"/.test(readFileSync(outFile, "utf8")); // only successes are kept
+		if (!cached) {
+			const res = spawnSync("sh", ["-c", ev.command], {
+				env: { ...process.env, RER_WORKDIR: workdir, RER_EVAL_DIR: ev.dir ? at(ev.dir) : "", RER_OUT: outFile },
+				encoding: "utf8", timeout: (ev.timeoutMinutes ?? 30) * 60_000, cwd: base,
+			});
+			if (res.status !== 0 || !existsSync(outFile)) writeFileSync(outFile, JSON.stringify({ error: `evaluator wrote no result (exit ${res.status})`, stderr: (res.stderr ?? "").slice(-2000) }, null, 2));
+			console.log(`  evaluated ${id} (exit ${res.status})`);
+		}
+		let result: Record<string, unknown> = {};
+		try {
+			result = JSON.parse(readFileSync(outFile, "utf8"));
+		} catch {
+			result = { error: "evaluation.json is not JSON" };
+		}
+		for (const [k, v] of Object.entries(result)) rows.push([r.arm, r.run, k, typeof v === "object" ? JSON.stringify(v) : String(v)]);
+	}
+	const file = at(`${cfg.runsDir}/${cfg.name}-evaluation${faux ? "-faux" : ""}.csv`);
+	writeFileSync(file, csv(rows));
+	// Per arm: mean of every numeric metric over runs, with the range, so one good run does not read as a trend.
+	const data = rows.slice(1).map(([arm, run, metric, value]) => ({ arm: String(arm), run: String(run), metric: String(metric), value: Number(value) })).filter((d) => !Number.isNaN(d.value));
+	const arms = [...new Set(data.map((d) => d.arm))].sort();
+	const metrics = [...new Set(data.map((d) => d.metric))].sort();
+	const lines = [`# Objective evaluation: ${cfg.name}`, "", `| metric | ${arms.join(" | ")} |`, `|---|${arms.map(() => "---").join("|")}|`];
+	for (const m of metrics)
+		lines.push(`| ${m} | ${arms.map((a) => {
+			const v = data.filter((d) => d.arm === a && d.metric === m).map((d) => d.value);
+			return v.length ? `${(v.reduce((x, y) => x + y, 0) / v.length).toFixed(3)} (${Math.min(...v)}–${Math.max(...v)}, n=${v.length})` : "–";
+		}).join(" | ")} |`);
+	const failed = rows.slice(1).filter((r) => r[2] === "error").map((r) => `${r[0]}-${r[1]}`);
+	if (failed.length) lines.push("", `Evaluator errors: ${failed.join(", ")}`);
+	writeFileSync(file.replace(/\.csv$/, ".md"), lines.join("\n") + "\n");
+	console.log(lines.join("\n"));
+}
+
 /** Blind judging. Packets hold the doer's final answer and its result files, never the questions or pushes, with
  *  leak terms and the workdir path redacted; labels are random and the key is a separate file. Blind judges score a
  *  fixed rubric; one informed judge scores only distance to the target. `--unblind` joins the key afterwards. */
@@ -1459,6 +1520,7 @@ async function autoWorker() {
 			console.log(`${id}: finished`);
 		}
 	}
+	if (cfg.evaluator) await evaluate();
 	setStatus({ phase: "study complete" });
 	notify("study complete");
 }
@@ -1523,6 +1585,7 @@ const commands: Record<string, () => unknown> = {
 	export: () => exportRun(opt("arm", Object.keys(cfg.arms)[0]), opt("run", "1")),
 	judge,
 	"import-pilot": importPilot,
+	evaluate,
 };
 if (!commands[command]) {
 	console.error(`unknown command ${command}`);

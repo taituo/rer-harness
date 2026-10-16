@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# No model API keys anywhere: every check runs on fake models (--faux).
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: test/ci.sh core
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: core-logs, path: "test/fixture/runs*" }
+
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: test/ci.sh docker
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: sandbox-logs, path: "test/fixture/runs*" }

@@ -1,0 +1,26 @@
+{
+  "name": "ci",
+  "runsDir": "runs",
+  "arms": {
+    "rer": "questions.md",
+    "topic": { "file": "questions.md", "cut": 1, "padTo": 3, "padPush": "continue" },
+    "control": "control.md"
+  },
+  "pushes": "../../study/pushes.md",
+  "afterPath": ["open-1"],
+  "target": "target.md",
+  "leakTerms": ["zebrafinch"],
+  "analysis": "../../study/analysis.md",
+  "workdir": "/tmp/rer-ci-work",
+  "doer": { "model": "anthropic/claude-opus-5-5", "thinking": "xhigh", "instructions": "../../study/doer.md" },
+  "observers": [
+    { "name": "A", "model": "anthropic/claude-opus-5-5", "informed": true, "instructions": "../../study/observer.md" },
+    { "name": "B", "model": "openai/gpt-6-sol", "informed": false, "instructions": "../../study/observer.md" }
+  ],
+  "guessers": { "models": ["anthropic/claude-opus-5-5"], "cutoffs": [1, 3], "repeats": 1, "prompt": "../../study/guess.md",
+                "scorers": ["openai/gpt-6-sol"], "scoreRubric": "../../study/score-guess.md" },
+  "judge": { "blind": ["anthropic/claude-opus-5-5"], "informed": "openai/gpt-6-sol", "rubric": "../../study/judge.md", "distanceRubric": "../../study/judge-distance.md" },
+  "budget": { "stallPush": "stuck" },
+  "auto": { "runs": 1, "arms": ["rer", "topic", "control"] },
+  "live": false
+}

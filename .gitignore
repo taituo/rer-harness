@@ -1,3 +1,8 @@
 node_modules/
 runs/
 runs-test/
+test/fixture/runs/
+test/fixture/runs.*
+test/fixture/work/
+test/fixture/*.freeze.json
+test/fixture/ci-*.json
