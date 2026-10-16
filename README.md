@@ -39,6 +39,14 @@ Drop a `.txt` file into the run's inbox (`runs/inbox-<run>/`, printed at start).
 - `@push deeper` sends that push from `pushes.md`. Written in advance and frozen, it carries nothing about the target: the run stays clean. An unknown id is moved to `rejected/` instead of stopping the run.
 - Anything else is free text: delivered, and the run is marked `rer.contaminated` from that point. Analyze those runs separately.
 
+## Talking to observers
+
+Each column on the live page has a message box. Type to an observer and it answers in its own column, mid-run; nothing you say to an observer ever reaches the researcher. Without the page, drop a `.txt` into `runs/inbox-<run>/observer-<name>/`. Both paths are recorded the same way, as `rer.intervention` entries in that observer's transcript.
+
+A message to a blind observer is also marked `rer.human-contact`, because you know the target and it does not: anything you say could end its blindness, so analyze its later comments with that in mind.
+
+The researcher's box sends the same thing as the inbox: `@push <id>` stays clean, free text asks for confirmation and marks the run contaminated.
+
 ## Observers
 
 Each observer gets a digest of every step (capped by `digest.maxChars`, keeping the start and the end), and read-only tools to go deeper whenever it wants: `transcript` (the doer's full transcript, including reasoning and complete outputs), `files` (list and read the doer's project files) and `search` (regex over both). The doer never gets these tools, so the transcripts and the observers' discussion cannot reach it.

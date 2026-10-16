@@ -490,12 +490,25 @@ function observeTools(getDoer: () => Promise<Conversation>, workdir: string) {
 // ---------- live view ----------
 
 /** Serves live.html and a stream of every conversation's agent events from this process (the only storage owner). */
-function startLive(harness: Harness, convs: Record<string, Conversation>) {
+function startLive(harness: Harness, convs: Record<string, Conversation>, say: (to: string, message: string) => boolean) {
 	if (cfg.live === false) return () => {};
 	const port = cfg.live?.port ?? 7777;
 	const host = cfg.live?.host ?? "127.0.0.1";
 	const server = createServer(async (req, res) => {
 		if (req.url === "/status") return res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(status));
+		if (req.url === "/say" && req.method === "POST") {
+			let body = "";
+			req.on("data", (d) => (body += d));
+			req.on("end", () => {
+				try {
+					const { to, text: message } = JSON.parse(body);
+					res.writeHead(say(String(to), String(message)) ? 200 : 400).end();
+				} catch {
+					res.writeHead(400).end();
+				}
+			});
+			return;
+		}
 		if (req.url !== "/events") return res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(readFileSync(join(here, "live.html")));
 		res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
 		const send = (data: unknown) => res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -677,27 +690,46 @@ async function run(arm: string, runNo: string) {
 		observers.push({ o, c: await named(harness, `observer:${o.name}`, agentFor(o, extra, observeExt)) });
 	}
 
-	const stopLive = startLive(harness, { doer, ...Object.fromEntries(observers.map(({ o, c }) => [`observer:${o.name}`, c])) });
-
 	const inbox = at(cfg.inbox ?? `${cfg.runsDir}/inbox-${id}`);
 	mkdirSync(`${inbox}/done`, { recursive: true });
 	mkdirSync(`${inbox}/rejected`, { recursive: true });
+	// Inbox: files in the inbox go to the doer; files in inbox/observer-<name>/ go to that observer.
+	const isFile = (p: string) => statSync(p).isFile();
+	const pending = (dir: string) => (existsSync(dir) ? readdirSync(dir).filter((f) => !f.startsWith(".") && isFile(join(dir, f))).sort() : []);
+	const obsDir = (name: string) => join(inbox, `observer-${name}`);
+	for (const { o } of observers) mkdirSync(obsDir(o.name), { recursive: true });
 	const pollInbox = async () => {
-		for (const f of readdirSync(inbox).filter((f) => !f.startsWith(".") && !["done", "rejected"].includes(f)).sort()) {
-			const raw = readFileSync(`${inbox}/${f}`, "utf8").trim();
+		for (const f of pending(inbox)) {
+			const raw = readFileSync(join(inbox, f), "utf8").trim();
 			const m = raw.match(/^@push\s+(\S+)/);
 			if (m && !pushes[m[1]]) {
-				renameSync(`${inbox}/${f}`, `${inbox}/rejected/${f}`);
+				renameSync(join(inbox, f), join(inbox, "rejected", f));
 				console.error(`  löyly rejected: ${f} names unknown push "${m[1]}"`);
 				continue;
 			}
 			const type = m ? "menu" : "free";
 			if (type === "free") await write(`contaminated:${f}`, "rer.contaminated", { file: f, at: new Date().toISOString() });
 			await doer.submit({ type: "input", content: m ? pushes[m[1]] : raw, whenBusy: "steer", requestId: `int:${f}`, entry: { kind: "rer.intervention", data: { type, file: f, push: m?.[1] ?? null } } } as any, ctx);
-			renameSync(`${inbox}/${f}`, `${inbox}/done/${f}`);
+			renameSync(join(inbox, f), join(inbox, "done", f));
 			console.log(`  löyly (${type}) delivered: ${f}`);
 			notify(`intervention (${type}) delivered in ${id}`);
 		}
+		// Talking to an observer never reaches the doer. A message to a blind observer may break its blindness, so it is marked.
+		for (const { o, c } of observers)
+			for (const f of pending(obsDir(o.name))) {
+				const raw = readFileSync(join(obsDir(o.name), f), "utf8").trim();
+				if (!o.informed) await c.submit({ type: "write", requestId: `human:${f}`, entry: { kind: "rer.human-contact", data: { file: f, at: new Date().toISOString() } } } as any, ctx);
+				await c.submit({ type: "input", content: raw, whenBusy: "steer", requestId: `int:${f}`, entry: { kind: "rer.intervention", data: { type: "observer", file: f } } } as any, ctx);
+				renameSync(join(obsDir(o.name), f), join(inbox, "done", `observer-${o.name}-${f}`));
+				console.log(`  message to observer ${o.name} delivered: ${f}`);
+			}
+	};
+	/** From the live page: the same as dropping a file into the inbox, so both paths are recorded identically. */
+	const say = (to: string, message: string) => {
+		const dir = to === "doer" ? inbox : observers.some(({ o }) => `observer:${o.name}` === to) ? obsDir(to.slice(9)) : undefined;
+		if (!dir || !message.trim()) return false;
+		writeFileSync(join(dir, `${Date.now()}-live.txt`), message.trim() + "\n");
+		return true;
 	};
 	const budget = async () => {
 		const spent = await costUsd(harness);
@@ -707,7 +739,8 @@ async function run(arm: string, runNo: string) {
 			throw new BudgetReached(`budget reached ($${spent.toFixed(2)} of $${cfg.budget.maxUsd})`);
 		}
 	};
-	console.log(`run ${id}: ${plan.length} steps\ndrop a .txt into ${inbox} to intervene ("@push <id>" for a menu push, anything else is free and marks the run)`);
+	const stopLive = startLive(harness, { doer, ...Object.fromEntries(observers.map(({ o, c }) => [`observer:${o.name}`, c])) }, say);
+	console.log(`run ${id}: ${plan.length} steps\ndrop a .txt into ${inbox} to intervene ("@push <id>" for a menu push, anything else is free and marks the run); observers: ${inbox}/observer-<name>/`);
 	notify(`run ${id} started`);
 
 	let ending = "completed";
@@ -732,7 +765,7 @@ async function run(arm: string, runNo: string) {
 				for (const { o, c } of observers) {
 					const heard = said.filter((s) => o.informed || cfg.blindSeesInformed || !s.informed);
 					const discussion = heard.length ? `\n\nDiscussion so far:${heard.map((s) => `\n\n${s.name}: ${s.text}`).join("")}` : "";
-					said.push({ name: o.name, informed: !!o.informed, text: await ask(c, `obs:${step.key}:${round}`, fill(T.observerStep, { step: i + 1, digest, discussion })) });
+					said.push({ name: o.name, informed: !!o.informed, text: await ask(c, `obs:${step.key}:${round}`, fill(T.observerStep, { step: i + 1, digest, discussion }), {}, pollInbox) });
 				}
 			notify(`${id}: step ${i + 1}/${plan.length} done`);
 		}
