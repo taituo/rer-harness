@@ -46,7 +46,8 @@
   "designer": {
     "model": "xai/grok-4.7",
     "thinking": "xhigh",
-    "instructions": "designer.md"
+    "instructions": "designer.md",
+    "blindInstructions": "designer-blind.md"
   },
   "guessers": {
     "models": [
@@ -64,10 +65,19 @@
     ],
     "repeats": 5,
     "prompt": "guess.md",
-    "shuffled": true
+    "shuffled": true,
+    "scoreRubric": "score-guess.md",
+    "leakThreshold": 1.5,
+    "scorers": [
+      "anthropic/claude-opus-5-5",
+      "openai/gpt-6-sol"
+    ]
   },
   "budget": {
-    "maxUsd": 150
+    "maxUsd": 150,
+    "maxWallMinutes": 720,
+    "stallMinutes": 20,
+    "stallPush": "stuck"
   },
   "retries": 2,
   "digest": {
@@ -97,5 +107,23 @@
       "on": "net-on",
       "off": "net-off"
     }
-  }
+  },
+  "analysis": "analysis.md",
+  "domain": "domain.md",
+  "leakTerms": [
+    "handwired",
+    "cheng lou"
+  ],
+  "targetPublishedAt": "2026-10-15",
+  "judge": {
+    "blind": [
+      "anthropic/claude-opus-5-5",
+      "openai/gpt-6-sol"
+    ],
+    "informed": "xai/grok-4.7",
+    "thinking": "high",
+    "rubric": "judge.md",
+    "distanceRubric": "judge-distance.md"
+  },
+  "knowledgeCutoffs": {}
 }

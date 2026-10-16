@@ -22,13 +22,26 @@ nohup node rer.ts auto study/experiment.json > runs/auto.log 2>&1 &
 
 1. Checks every model exists and has credentials, before spending anything.
 2. Runs the guessers for each arm (the leakage test).
-3. Runs `auto.runs` repetitions of every arm, alternating the order (rer, control, control, rer, …) so time of day and provider drift don't line up with one arm. For each run it starts a fresh sandbox container, checks isolation, runs the path, and exports transcripts.
+3. Runs `auto.runs` repetitions of every arm in Latin-square order (each run index rotates the arm list), so time of day and provider drift don't line up with one arm. For each run it starts a fresh sandbox container, checks isolation, runs the path, and exports transcripts.
 4. A crash, a killed process or a reboot loses nothing: the supervisor restarts the worker with growing backoff, finished runs are skipped, and an unfinished run continues from its last step (every submission has a request id, so nothing is asked twice). Each restart is visible in the record as a new `rer.session` entry.
 5. It stops for good on anything a restart cannot fix: files changed since freeze, isolation failed, missing credentials, a model changed mid-run. That is exit code 3 and a notification.
 
-Per-run budget (`budget.maxUsd` and/or `budget.maxTokens`) is checked every two seconds while the doer works, not just between steps; crossing it aborts the doer and ends the run, recorded as such. Cost is computed from token counts and catalog prices, not from what a provider reports.
+Per-run limits are checked every two seconds while the doer works, and any one ends the run, recorded as such: `budget.maxUsd`, `budget.maxTokens`, `budget.maxWallMinutes`. `budget.stallMinutes` catches a doer that has gone silent (no thinking, text or tool output, such as a hung shell loop): the turn is aborted and the frozen `stallPush` is sent, the same in every arm; a second stall in the same step ends the run as `stalled`. Cost is computed from token counts and catalog prices, not from what a provider reports.
 
 `--faux` runs the whole thing offline with fake models, to check a study before paying for it.
+
+## After the runs
+
+```bash
+node rer.ts score-guesses study/experiment.json          # leakage curve per arm, scored blind
+node rer.ts judge study/experiment.json                  # blind judging of final outputs (labels only)
+#   spot-check some packets yourself into human.csv, then:
+node rer.ts judge study/experiment.json --unblind        # means per arm, spread, agreement
+```
+
+Each run's export also has `summary.json` (ending, stalls, retries, restarts, interventions, network, warnings, cost), `ledger.csv` (the observers' idea ledger with the path release point in the summary), and `files.json` (every file the doer left, with hashes).
+
+**[docs/study-design.md](docs/study-design.md)** shows how to build a study that can carry the main claim: topic-matched and cut-path arms, an impossible-target arm, a blind designer, stall limits, blind scoring and judging, the analysis plan, the librarian, model cutoffs, and the pilot.
 
 ## OpenCode Go
 
@@ -114,12 +127,18 @@ Blind observers speak first and never see what informed observers say, so a blin
 | `doer.md` | the doer's standing instructions |
 | `target.md` | the designer and informed observers only |
 | `observer.md`, `designer.md`, `guess.md` | observers, designer, guessers |
+| `analysis.md` | nobody: the analysis plan, frozen before any result exists |
+| `score-guess.md`, `judge.md`, `judge-distance.md` | scorers, blind judges, the informed judge |
+| `designer-blind.md`, `domain.md` | the designer in `design --blind` |
+| `librarian.md` | the librarian, if `library` is configured |
+
+Arms can be files or derived from one: `{ "file": "questions.md", "cut": 6, "padTo": 20, "padPush": "continue" }`, `{ "file": …, "shuffle": "seed" }`, or with their own `"target"`.
 
 The two observer-facing strings in the code (how a step is handed over, how the target is introduced) can be replaced with `templates` in the config.
 
 ## Single commands
 
-`node rer.ts run|export <config> --arm rer --run 1`, `node rer.ts guess <config> --arm rer`, `node rer.ts models <config> [--provider P]`. With `sandbox.start` set, `run` starts the container itself.
+`node rer.ts run|export <config> --arm rer --run 1`, `node rer.ts guess <config> --arm rer`, `node rer.ts design <config> [--arm X] [--blind]`, `node rer.ts import-pilot <config> <file> --arm rer`, `node rer.ts models <config> [--provider P]`. With `sandbox.start` set, `run` starts the container itself.
 
 ## Isolation
 

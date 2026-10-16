@@ -87,11 +87,16 @@ Observer, which never reaches the doer:
 echo "What is the weakest claim so far?" > runs/inbox-<run>/observer-B/q.txt
 ```
 
+## Design before freezing
+
+Read `docs/study-design.md`. A study that can carry the main claim needs a topic arm (`cut: 1, padTo`), not only a control; consider cut-path arms and an impossible-target arm. Write `study/analysis.md` before `freeze`; `freeze` warns if there is none. Set `budget.stallMinutes` and `maxWallMinutes`.
+
 ## Results
 
-After `study complete`:
+After `study complete`, in this order, and do not open keys early:
 
-1. Guesses: `runs/<name>-<arm>-guesses.jsonl`. Score each answer blind to arm, order and cutoff: 0 unrelated, 1 same area, 2 identifies the target. Then compare: at which cutoff does the path start giving the target away, and how does the shuffled order and the control arm compare?
-2. Runs: `runs/<run>/doer.md`, `observer-*.md`, `usage.json`; raw record in `runs/<run>.sqlite`.
-3. Compare arms on what the doer actually built and verified, not on how it described it. Note every contaminated run, human contact with the blind observer, retry, restart and budget stop; report them, do not drop them.
-4. Report what failed as plainly as what worked.
+1. `node rer.ts score-guesses <config>`: the leakage curve and leak point per arm, scored blind.
+2. `node rer.ts judge <config>`: blind judgements by label. Ask the human to spot-check some packets into `human.csv` before unblinding.
+3. `node rer.ts judge <config> --unblind`: means per arm, spread across runs, agreement.
+4. Per run: `summary.json` (ending, stalls, interventions, network, warnings, release point), `ledger.csv`, transcripts, `files.json`.
+5. Follow `study/analysis.md`. Report every contaminated run, human contact with the blind observer, stall, retry, restart and budget stop; do not drop them. Report what failed as plainly as what worked.

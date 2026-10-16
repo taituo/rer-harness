@@ -1,20 +1,24 @@
 // RER harness: Reverse Eureka Reconstruction on Pi Durable.
 //
-//   node rer.ts auto    <config>            the whole study, unattended: guess, every arm × run, export; restarts on crashes
-//   node rer.ts design  <config>            designer drafts a question path from the target
-//   node rer.ts freeze  <config>            hash every study file into freeze.json (commit it)
-//   node rer.ts guess   <config> [--arm X]  leakage test: tool-less guessers see questions 1..k
-//   node rer.ts run     <config> [--arm X] [--run N]   one run: doer walks the path, observers follow
-//   node rer.ts export  <config> [--arm X] [--run N]   transcripts to markdown
-//   node rer.ts models  <config> [--provider P]   which models exist and have credentials
+//   node rer.ts auto           <config>   the whole study, unattended: guess, every arm × run, export; restarts on crashes
+//   node rer.ts design         <config> [--arm X] [--blind]   draft a question path from the arm's target (or, blind, from domain)
+//   node rer.ts freeze         <config>   hash every study file and the analysis plan (commit the freeze file)
+//   node rer.ts guess          <config> [--arm X]   leakage test: tool-less guessers see questions 1..k
+//   node rer.ts score-guesses  <config>   blind scorers rate every guess against the target; leakage curve per arm
+//   node rer.ts run            <config> [--arm X] [--run N]   one run: doer walks the path, observers follow
+//   node rer.ts export         <config> [--arm X] [--run N]   transcripts, idea ledger, file tree, summary
+//   node rer.ts judge          <config> [--unblind]   blind judges score anonymized final outputs; --unblind joins the key
+//   node rer.ts import-pilot   <config> <file> [--arm X]   keep a pilot transcript as run 0, excluded from analysis
+//   node rer.ts models         <config> [--provider P]   which models exist and have credentials
 //
-// Flags: --faux (offline dry run with a fake model), --unfrozen (allow edits after freeze; recorded),
+// Flags: --faux (offline dry run with fake models), --unfrozen (allow edits after freeze; recorded),
 //        --allow-leaks (run even if the isolation canary fails; recorded).
 //
-// Everything study-specific lives in the config and the files it points to. Nothing doer-facing is in this file.
+// Everything study-specific lives in the config and the files it points to. Nothing a model reads is in this file,
+// except the short framing templates in T, which the config can replace.
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -34,7 +38,10 @@ const here = dirname(new URL(import.meta.url).pathname);
 
 /** Stops the study: a rerun cannot fix it (not frozen, not isolated, config mismatch). Exit code 3. */
 class Fatal extends Error {}
-class BudgetReached extends Error {}
+/** Ends one run early but properly: recorded, exported, and the study goes on. */
+class RunEnded extends Error {}
+/** The doer went quiet for stallMinutes; thrown from the poll loop after the stall is recorded and the turn aborted. */
+class Stall extends Error {}
 
 // ---------- config ----------
 
@@ -42,31 +49,44 @@ type Role = { model: string; thinking?: string; instructions?: string };
 /** start: state at the first step. schedule: step key -> state before that step (q1…, open1…). announce: push ids sent
  *  to the doer when its internet changes, so it is not left believing whatever doer.md said. */
 type Network = { start?: "on" | "off"; schedule?: Record<string, "on" | "off">; announce?: { on?: string; off?: string } };
+/** An arm is a step file, or a step file transformed: keep steps 1..cut, shuffle steps 2..n with a seed, pad to padTo
+ *  steps with a frozen push so every arm gets the same number of turns, and optionally its own target. */
+type ArmSpec = { file: string; cut?: number; shuffle?: string; padTo?: number; padPush?: string; target?: string };
 type Config = {
 	name: string;
 	runsDir: string;
-	arms: Record<string, string>; // arm name -> step file (question path, or control prompts)
+	arms: Record<string, string | ArmSpec>;
 	pushes?: string; // push bank: "## id" sections
 	autoPushes?: string[]; // push ids sent after every step, same for every arm
 	afterPath?: string[]; // push ids sent as extra steps once the path ends (open phase)
-	target?: string; // the known solution B: only the designer and informed observers see it
+	target?: string; // the known solution B: only the designer, informed observers, scorers and the informed judge see it
+	domain?: string; // the area without the destination, for `design --blind`
+	analysis?: string; // the analysis plan, frozen with everything else
+	leakTerms?: string[]; // words that give the target away; redacted from judge packets and library answers
+	targetPublishedAt?: string; // when B became public (YYYY-MM-DD); compared with knowledgeCutoffs
+	knowledgeCutoffs?: Record<string, string>; // model -> training cutoff (YYYY-MM or YYYY-MM-DD)
 	workdir: string; // base dir; each run gets a neutral subdirectory
 	sandbox?: { start?: string; shell?: string; net?: string; container?: string; forbiddenPaths?: string[] };
 	network?: Network; // the doer's internet: off unless this says otherwise
-	networkByArm?: Record<string, Network>; // per-arm override, e.g. the same schedule for both arms, or none for control
+	networkByArm?: Record<string, Network>;
 	doer: Role;
 	observers?: (Role & { name: string; informed?: boolean })[];
 	observerRounds?: number;
-	observerTools?: boolean; // read-only access to the doer's full transcript and files (default true)
+	observerTools?: boolean; // read-only access to the doer's transcript and files, plus the idea ledger (default true)
 	blindSeesInformed?: boolean; // default false: blind observers never see what informed ones say
-	designer?: Role;
-	guessers?: { models: string[]; thinking?: string; cutoffs: number[]; repeats: number; prompt: string; shuffled?: boolean };
-	budget?: { maxUsd?: number; maxTokens?: number }; // per run; maxTokens suits subscriptions (OpenCode Go) where dollars do not apply
+	designer?: Role & { blindInstructions?: string };
+	guessers?: {
+		models: string[]; thinking?: string; cutoffs: number[]; repeats: number; prompt: string; shuffled?: boolean;
+		scorers?: string[]; scoreRubric?: string; leakThreshold?: number;
+	};
+	judge?: { blind: string[]; informed?: string; thinking?: string; rubric: string; distanceRubric?: string; resultFiles?: string[]; maxPacketChars?: number };
+	library?: { model: string; thinking?: string; instructions?: string; search: string; before?: string; fromStep?: string; maxResults?: number; allowUndated?: boolean };
+	budget?: { maxUsd?: number; maxTokens?: number; maxWallMinutes?: number; stallMinutes?: number; stallPush?: string }; // per run
 	modelRetries?: number; // provider retries inside one model call (no new message to the model)
 	retries?: number; // resubmissions after a call still failed; each is recorded
 	inbox?: string;
 	digest?: { maxToolChars?: number; maxChars?: number; includeThinking?: boolean };
-	templates?: { observerStep?: string; informedTarget?: string }; // {step} {digest} {discussion} / {target}
+	templates?: { observerStep?: string; informedTarget?: string; libraryQuestion?: string };
 	auto?: { runs?: number; arms?: string[]; guess?: boolean; maxRestarts?: number };
 	live?: { port?: number; host?: string } | false;
 	notify?: string; // shell command run on the host with $RER_MESSAGE, e.g. curl -d "$RER_MESSAGE" ntfy.sh/topic
@@ -79,9 +99,10 @@ const opt = (name: string, fallback: string) => {
 	return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 };
 const valued = new Set(["--arm", "--run", "--provider"]);
-const [command, configArg] = args.filter((a, i) => !a.startsWith("--") && !valued.has(args[i - 1]));
+const positional = args.filter((a, i) => !a.startsWith("--") && !valued.has(args[i - 1]));
+const [command, configArg] = positional;
 if (!command || !configArg) {
-	console.error("usage: node rer.ts <auto|design|freeze|guess|run|export|models> <config.json> [--arm rer] [--run 1] [--provider opencode-go] [--faux]");
+	console.error("usage: node rer.ts <auto|design|freeze|guess|score-guesses|run|export|judge|import-pilot|models> <config.json> [--arm rer] [--run 1] [--faux]");
 	process.exit(2);
 }
 const configPath = resolve(configArg);
@@ -90,30 +111,71 @@ const cfg: Config = JSON.parse(readFileSync(configPath, "utf8"));
 const at = (p: string) => (isAbsolute(p) ? p : resolve(base, p));
 const text = (p: string) => readFileSync(at(p), "utf8");
 const stripComments = (s: string) => s.replace(/<!--[\s\S]*?-->/g, "");
+const clean = (p: string) => stripComments(text(p)).trim();
 const sha = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const csv = (rows: (string | number)[][]) => rows.map((r) => r.map((v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v))).join(",")).join("\n") + "\n";
 
 /** Steps: blocks separated by a line containing only "---". HTML comments are author notes and never sent. */
 function steps(file: string): string[] {
 	return stripComments(text(file)).split(/^---\s*$/m).map((s) => s.trim()).filter(Boolean);
 }
 /** Push bank: "## id" headings, body until the next heading. */
-function pushBank(): Record<string, string> {
-	if (!cfg.pushes) return {};
-	const out: Record<string, string> = {};
+const pushes: Record<string, string> = {};
+if (cfg.pushes && existsSync(at(cfg.pushes)))
 	for (const part of stripComments(text(cfg.pushes)).split(/^## +/m).slice(1)) {
 		const nl = part.indexOf("\n");
-		out[part.slice(0, nl).trim()] = part.slice(nl + 1).trim();
+		pushes[part.slice(0, nl).trim()] = part.slice(nl + 1).trim();
 	}
-	return out;
+function pick(pid: string) {
+	if (!pushes[pid]) throw new Fatal(`push "${pid}" not in ${cfg.pushes}`);
+	return pushes[pid];
 }
 const fill = (t: string, v: Record<string, string | number>) => t.replace(/\{(\w+)\}/g, (m, k) => (k in v ? String(v[k]) : m));
 const T = {
 	observerStep: "Step {step}, what the researcher did:\n\n{digest}{discussion}",
 	informedTarget: "The work you are observing is heading, knowingly or not, toward this known result:\n\n{target}",
+	libraryQuestion: "Question: {question}\n\nSources you may use (and only these):\n\n{sources}",
 	...cfg.templates,
 };
-const instructions = (r: { instructions?: string }) => (r.instructions ? stripComments(text(r.instructions)).trim() || undefined : undefined);
+const instructions = (r: { instructions?: string }) => (r.instructions ? clean(r.instructions) || undefined : undefined);
+
+// ---------- arms ----------
+
+type Step = { key: string; text: string; entry?: { kind: string; data: object } };
+function armSpec(arm: string): ArmSpec {
+	const a = cfg.arms[arm];
+	if (!a) throw new Fatal(`unknown arm ${arm}; config has ${Object.keys(cfg.arms).join(", ")}`);
+	return typeof a === "string" ? { file: a } : a;
+}
+/** The path steps an arm sends, after cut, shuffle and padding; recorded in every run so it states what it received. */
+function armSteps(arm: string): Step[] {
+	const spec = armSpec(arm);
+	let list: Omit<Step, "key">[] = steps(spec.file).map((t) => ({ text: t }));
+	if (spec.cut) list = list.slice(0, spec.cut);
+	if (spec.shuffle) list = [list[0], ...seededShuffle(list.slice(1), sha(spec.shuffle))].filter(Boolean);
+	if (spec.padTo) {
+		const id = spec.padPush ?? "continue";
+		while (list.length < spec.padTo) list.push({ text: pick(id), entry: { kind: "rer.push", data: { id, pad: true } } });
+	}
+	return list.map((s, i) => ({ key: `q${i + 1}`, ...s }));
+}
+const armTarget = (arm: string) => armSpec(arm).target ?? cfg.target;
+const targetText = (arm: string) => {
+	const t = armTarget(arm);
+	return t ? clean(t) : undefined;
+};
+
+function seededShuffle<T>(list: T[], seed: string): T[] {
+	const a = [...list];
+	let s = parseInt(seed.slice(0, 8), 16);
+	for (let i = a.length - 1; i > 0; i--) {
+		s = (s * 1664525 + 1013904223) >>> 0;
+		const j = s % (i + 1);
+		[a[i], a[j]] = [a[j], a[i]];
+	}
+	return a;
+}
 
 // ---------- status and notifications ----------
 
@@ -134,33 +196,43 @@ function notify(message: string) {
 // ---------- models ----------
 
 const faux = flag("faux");
-function fauxId(m: string) {
-	return m.replace(/[^a-zA-Z0-9.-]/g, "_");
-}
+const fauxId = (m: string) => m.replace(/[^a-zA-Z0-9.-]/g, "_");
+const allModels = () =>
+	[...new Set([cfg.doer, cfg.designer, ...(cfg.observers ?? [])].filter(Boolean).map((r) => r!.model)
+		.concat(cfg.guessers?.models ?? [], cfg.guessers?.scorers ?? [], cfg.judge?.blind ?? [], cfg.judge?.informed ? [cfg.judge.informed] : [], cfg.library ? [cfg.library.model] : []))];
 const models = builtinModels();
 if (faux) {
 	const usdPerMTok = Number(process.env.RER_FAUX_COST ?? 0); // faux-only: make budget limits testable
-		// One fake model per configured model, so per-role usage and the model-mismatch guard behave as in a real run.
-	const ids = [...new Set([cfg.doer, cfg.designer, ...(cfg.observers ?? [])].filter(Boolean).map((r) => r!.model).concat(cfg.guessers?.models ?? []))].map(fauxId);
-	const f = fauxProvider({ provider: "faux", models: ids.map((id) => ({ id, reasoning: true, cost: { input: usdPerMTok, output: usdPerMTok, cacheRead: 0, cacheWrite: 0 } })) as any, tokensPerSecond: Number(process.env.RER_FAUX_TPS ?? 0) || undefined });
+	// One fake model per configured model, so per-role usage and the model-mismatch guard behave as in a real run.
+	const f = fauxProvider({ provider: "faux", models: allModels().map(fauxId).map((id) => ({ id, reasoning: true, cost: { input: usdPerMTok, output: usdPerMTok, cacheRead: 0, cacheWrite: 0 } })) as any, tokensPerSecond: Number(process.env.RER_FAUX_TPS ?? 0) || undefined });
 	let n = 0;
 	const respond = (context: any) => {
 		const msgs = context.messages ?? [];
 		const last = msgs[msgs.length - 1];
 		const lastUser = [...msgs].reverse().find((m: any) => m.role === "user");
 		const said = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
+		const system = JSON.stringify(msgs.filter((m: any) => m.role === "system"));
 		const tools: string[] = msgs.flatMap((m: any) => (m.role === "system" ? (m.toolsAdded ?? []).map((t: any) => t.name ?? t) : []));
 		if (tools.length && last?.role === "user") {
 			// faux-only: RER_FAUX_TOOLS='[["bash",{...}],["read",{...}]]' plays these calls in order, to attack the sandbox
 			const script = process.env.RER_FAUX_TOOLS ? (JSON.parse(process.env.RER_FAUX_TOOLS) as [string, any][]) : undefined;
+			const observerCalls: [string, any][] = [["transcript", { count: 3 }], ["ledger", { idea: `idea ${n}`, origin: ["question", "doer", "prior-knowledge"][n % 3], evidence: "transcript #1", status: "claimed" }], ["files", {}], ["search", { pattern: "step" }]];
 			const call: [string, any] = tools.includes("bash")
 				? (script ? script[n++ % script.length] : ["bash", { command: `echo step ${++n} && pwd && ls` }])
-				: tools.includes("transcript") ? ([["transcript", { count: 3 }], ["files", {}], ["files", { path: "notes.txt" }], ["search", { pattern: "step" }], ["files", { path: "../../../etc/passwd" }]] as [string, any][])[n++ % 5] : [tools[0], {}];
+				: tools.includes("transcript") ? observerCalls[n++ % observerCalls.length] : [tools[0], {}];
 			return fauxAssistantMessage(fauxToolCall(call[0], call[1]), { stopReason: "toolUse" });
 		}
+		// A role asked for JSON gets the template from its instructions back, numbers filled in, so scoring pipelines run.
+		const template = system.match(/JSON:\s*(\{.*?\})/)?.[1]?.replace(/\\"/g, '"');
+		if (template)
+			try {
+				const t = JSON.parse(template);
+				for (const k of Object.keys(t)) t[k] = typeof t[k] === "number" ? (n++ % (Math.max(1, t[k]) + 1)) : "faux";
+				return fauxAssistantMessage(fauxText(JSON.stringify(t)));
+			} catch {}
 		return fauxAssistantMessage(fauxText(`[faux] responding to: ${said.slice(0, 80).replace(/\s+/g, " ")}`));
 	};
-	f.appendResponses(Array.from({ length: 20000 }, () => respond));
+	f.appendResponses(Array.from({ length: 50000 }, () => respond));
 	models.setProvider(f.provider);
 }
 const ref = (m: string) => {
@@ -169,6 +241,29 @@ const ref = (m: string) => {
 	if (i < 0) throw new Fatal(`model "${m}" must be provider/modelId`);
 	return { provider: m.slice(0, i), modelId: m.slice(i + 1) };
 };
+
+/** Fail before starting, not after retries: every model must exist and have credentials. Also warn when a model's
+ *  training may already contain the target, because then "discovery" cannot be told apart from recall. */
+async function preflight(roles: string[]) {
+	const warnings = cutoffWarnings(roles);
+	for (const w of warnings) console.warn(`warning: ${w}`);
+	if (faux) return warnings;
+	for (const m of new Set(roles)) {
+		const { provider, modelId } = ref(m);
+		if (!models.getModel(provider, modelId)) throw new Fatal(`unknown model ${m}`);
+		if (!(await models.getAuth(provider).catch(() => undefined))) throw new Fatal(`no credentials for ${provider} (needed by ${m}); set its API key`);
+	}
+	return warnings;
+}
+function cutoffWarnings(roles: string[]) {
+	const published = cfg.targetPublishedAt;
+	if (!published) return [];
+	return [...new Set(roles)].flatMap((m) => {
+		const cutoff = cfg.knowledgeCutoffs?.[m];
+		if (!cutoff) return [`${m} has no knowledgeCutoffs entry; cannot check whether it may know the target (published ${published})`];
+		return cutoff >= published.slice(0, cutoff.length) ? [`${m} has training cutoff ${cutoff}, not before the target's publication ${published}: it may know the target`] : [];
+	});
+}
 
 // ---------- paths and isolation ----------
 
@@ -269,7 +364,7 @@ async function canary(workdir: string) {
 	for (const [name, cmd] of Object.entries(probes)) results[name] = (await exec(cmd)) === 0 ? "leak" : "blocked";
 	const link = join(workdir, ".rer-canary-link");
 	spawnSync("ln", ["-sfn", base, link]);
-	results["guard:symlink"] = within(workdir, ".rer-canary-link/experiment.json") ? "leak" : "blocked";
+	results["guard:symlink"] = within(workdir, `.rer-canary-link/${basename(configPath)}`) ? "leak" : "blocked";
 	results["guard:parent"] = within(workdir, "../") ? "leak" : "blocked";
 	spawnSync("rm", ["-f", link]);
 	return { shellWorks, results, isolated: shellWorks && Object.values(results).every((v) => v === "blocked") };
@@ -378,6 +473,19 @@ async function answerText(c: Conversation, entryId: string) {
 	return render([...page.items], { includeThinking: false, maxToolChars: 0 });
 }
 
+/** Ask for JSON and parse the first object in the answer; a model that will not produce one gets two more chances. */
+async function askJson(c: Conversation, requestId: string, content: string): Promise<Record<string, unknown>> {
+	for (let i = 0; i < 3; i++) {
+		const answer = await ask(c, i ? `${requestId}~${i}` : requestId, i ? `${content}\n\nAnswer with the JSON object only.` : content);
+		const m = answer.match(/\{[\s\S]*\}/);
+		if (m)
+			try {
+				return JSON.parse(m[0]);
+			} catch {}
+	}
+	return { error: "no JSON" };
+}
+
 function render(list: EntryRecord[], o: { includeThinking?: boolean; maxToolChars?: number; user?: string } = cfg.digest ?? {}): string {
 	const max = o.maxToolChars ?? 4000;
 	const cut = (s: string) => (max && s.length > max ? `${s.slice(0, max)}\n…[${s.length - max} chars cut]` : s);
@@ -414,44 +522,50 @@ async function costUsd(harness: Harness) {
 	for (const v of Object.values(u.tools ?? {}) as any[]) total += v?.cost?.total ?? 0;
 	return total;
 }
-
 async function tokensUsed(harness: Harness) {
 	const u: any = await harness.usage(ctx);
 	return Object.values(u.models ?? {}).reduce((n: number, v: any) => n + (v?.totalTokens ?? 0), 0) as number;
 }
 
-/** Fail before starting, not after retries: every model must exist in the catalog and have credentials. */
-async function preflight(roles: string[]) {
-	if (faux) return;
-	for (const m of new Set(roles)) {
-		const { provider, modelId } = ref(m);
-		if (!models.getModel(provider, modelId)) throw new Fatal(`unknown model ${m}`);
-		if (!(await models.getAuth(provider).catch(() => undefined))) throw new Fatal(`no credentials for ${provider} (needed by ${m}); set its API key`);
-	}
-}
+// ---------- redaction ----------
 
-// ---------- observer tools: read-only view of the doer's full transcript and files ----------
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Replace every leak term (case-insensitive) and return how many were replaced, so redactions are logged. */
+function redact(s: string, extra: string[] = []): { text: string; count: number } {
+	let count = 0;
+	let out = s;
+	for (const term of [...(cfg.leakTerms ?? []), ...extra].filter(Boolean)) {
+		out = out.replace(new RegExp(escapeRe(term), "gi"), () => (count++, "[redacted]"));
+	}
+	return { text: out, count };
+}
+const mentionsLeak = (s: string) => (cfg.leakTerms ?? []).some((t) => s.toLowerCase().includes(t.toLowerCase()));
+
+// ---------- observer tools: read-only view of the doer's work, and the idea ledger ----------
+
+let observingStep = ""; // the step the observers are currently discussing, stamped on ledger rows
+
+function listFiles(dir: string, acc: string[] = []) {
+	for (const name of readdirSync(dir).sort()) {
+		if ([".git", "node_modules", "__pycache__", ".venv"].includes(name)) continue;
+		const p = join(dir, name);
+		const st = lstatSync(p);
+		if (st.isSymbolicLink()) continue;
+		if (st.isDirectory()) listFiles(p, acc);
+		else acc.push(p);
+		if (acc.length >= 2000) break;
+	}
+	return acc;
+}
+function readable(p: string) {
+	const st = statSync(p);
+	if (st.size > 2_000_000) return undefined;
+	const buf = readFileSync(p);
+	return buf.subarray(0, 8000).includes(0) ? undefined : buf.toString("utf8");
+}
 
 function observeTools(getDoer: () => Promise<Conversation>, workdir: string) {
 	const out = (t: string) => ({ output: [{ type: "text" as const, text: t }] });
-	const listFiles = (dir: string, acc: string[] = []) => {
-		for (const name of readdirSync(dir).sort()) {
-			if ([".git", "node_modules", "__pycache__", ".venv"].includes(name)) continue;
-			const p = join(dir, name);
-			const st = lstatSync(p);
-			if (st.isSymbolicLink()) continue;
-			if (st.isDirectory()) listFiles(p, acc);
-			else acc.push(p);
-			if (acc.length >= 2000) break;
-		}
-		return acc;
-	};
-	const readable = (p: string) => {
-		const st = statSync(p);
-		if (st.size > 2_000_000) return undefined;
-		const buf = readFileSync(p);
-		return buf.subarray(0, 8000).includes(0) ? undefined : buf.toString("utf8");
-	};
 	const transcriptLines = async () => {
 		const all = await entries(await getDoer());
 		return all.map((e) => render([e], { includeThinking: true, maxToolChars: 0 })).filter(Boolean).map((text, i) => ({ i, text }));
@@ -507,6 +621,67 @@ function observeTools(getDoer: () => Promise<Conversation>, workdir: string) {
 					return out(hits.length ? hits.join("\n") : "no matches");
 				},
 			}),
+			defineTool({
+				name: "ledger",
+				description: "Log one new idea in the shared idea ledger, once, when it first appears: where it came from (the question asked, the researcher itself, or prior knowledge the researcher brought in), the evidence (a transcript entry or file), and how far it got.",
+				parameters: Type.Object({
+					idea: Type.String(),
+					origin: Type.Union([Type.Literal("question"), Type.Literal("doer"), Type.Literal("prior-knowledge")]),
+					evidence: Type.String(),
+					status: Type.Union([Type.Literal("claimed"), Type.Literal("tested"), Type.Literal("verified")]),
+				}),
+				execute: async (a: any, api: any) => {
+					const row = { step: observingStep, idea: a.idea, origin: a.origin, evidence: a.evidence, status: a.status, at: new Date().toISOString() };
+					await api.commit(async (tx: any) => tx.appendEntry(api.conversationId, { kind: "rer.ledger", data: row }), ctx);
+					return out(`logged (${observingStep}): ${a.idea}`);
+				},
+			}),
+		],
+	});
+}
+
+// ---------- librarian: literature through a filter ----------
+
+/** The doer's only way to the literature: a librarian model that sees nothing but search results from before
+ *  `library.before`, with every result mentioning a leak term dropped, and whose answer is redacted again. */
+function libraryTool(harness: Harness) {
+	const lib = cfg.library!;
+	return defineExtension({
+		name: "rer.library",
+		tools: [
+			defineTool({
+				name: "ask_librarian",
+				description: "Ask the librarian a question about published literature. The librarian searches, reads, and answers with sources.",
+				parameters: Type.Object({ question: Type.String() }),
+				execute: async (a: any, api: any) => {
+					const searched = spawnSync("sh", ["-c", lib.search], { env: { ...process.env, QUERY: a.question }, encoding: "utf8", timeout: 60_000 });
+					let found: any[] = [];
+					try {
+						const parsed = JSON.parse(searched.stdout || "[]");
+						found = Array.isArray(parsed) ? parsed : (parsed.results ?? []);
+					} catch {
+						found = [];
+					}
+					const dropped = { afterCutoff: 0, undated: 0, leakTerm: 0 };
+					const kept = found.filter((r) => {
+						const blob = `${r.title ?? ""} ${r.url ?? ""} ${r.snippet ?? ""} ${r.text ?? ""}`;
+						if (mentionsLeak(blob)) return (dropped.leakTerm++, false);
+						if (!r.date) return lib.allowUndated ? true : (dropped.undated++, false);
+						if (lib.before && String(r.date) >= lib.before) return (dropped.afterCutoff++, false);
+						return true;
+					}).slice(0, lib.maxResults ?? 8);
+					const sources = kept.map((r, i) => `[${i + 1}] ${r.title ?? "untitled"} (${r.date ?? "undated"}) ${r.url ?? ""}\n${(r.text ?? r.snippet ?? "").slice(0, 4000)}`).join("\n\n");
+					let answer = "The library found no usable sources for this question.";
+					if (kept.length) {
+						const librarian = await named(harness, "librarian", agentFor({ model: lib.model, thinking: lib.thinking, instructions: lib.instructions }));
+						answer = await ask(librarian, `lib:${api.callId}`, fill(T.libraryQuestion, { question: a.question, sources }));
+					}
+					const red = redact(answer);
+					const listed = kept.map((r, i) => `[${i + 1}] ${r.title ?? "untitled"} (${r.date ?? "undated"}) ${r.url ?? ""}`).join("\n");
+					await api.commit(async (tx: any) => tx.appendEntry(api.conversationId, { kind: "rer.library", data: { question: a.question, found: found.length, kept: kept.map((r) => ({ title: r.title, url: r.url, date: r.date })), dropped, redactions: red.count, searchExit: searched.status } }), ctx);
+					return { output: [{ type: "text" as const, text: `${red.text}${listed ? `\n\nSources:\n${listed}` : ""}` }] };
+				},
+			}),
 		],
 	});
 }
@@ -559,13 +734,14 @@ function startLive(harness: Harness, convs: Record<string, Conversation>, say: (
 function studyFiles(): string[] {
 	const files = new Set<string>([configPath]);
 	const add = (p?: string) => p && files.add(at(p));
-	Object.values(cfg.arms).forEach(add);
-	[cfg.pushes, cfg.target, cfg.doer.instructions, cfg.designer?.instructions, cfg.guessers?.prompt].forEach(add);
+	for (const arm of Object.keys(cfg.arms)) [armSpec(arm).file, armSpec(arm).target].forEach(add);
+	[cfg.pushes, cfg.target, cfg.domain, cfg.analysis, cfg.doer.instructions, cfg.designer?.instructions, cfg.designer?.blindInstructions,
+		cfg.guessers?.prompt, cfg.guessers?.scoreRubric, cfg.judge?.rubric, cfg.judge?.distanceRubric, cfg.library?.instructions].forEach(add);
 	cfg.observers?.forEach((o) => add(o.instructions));
 	for (const s of [cfg.sandbox?.shell, cfg.sandbox?.start, cfg.sandbox?.net]) {
 		if (!s || !existsSync(at(s))) continue;
 		const dir = dirname(at(s));
-		for (const f of readdirSync(dir)) if (statSync(join(dir, f)).isFile()) files.add(join(dir, f)); // shell, start, Dockerfile
+		for (const f of readdirSync(dir)) if (statSync(join(dir, f)).isFile()) files.add(join(dir, f)); // shell, start, net, Dockerfile
 	}
 	for (const f of ["rer.ts", "live.html", "package-lock.json"]) files.add(join(here, f));
 	return [...files].filter(existsSync).sort();
@@ -591,23 +767,35 @@ function checkFrozen(): { frozen: boolean; diff: string[] } {
 	const diff = [...new Set([...Object.keys(frozen), ...Object.keys(now)])].filter((k) => frozen[k] !== now[k]);
 	return { frozen: diff.length === 0, diff };
 }
+function requireFrozen() {
+	const frozen = checkFrozen();
+	if (!frozen.frozen && !flag("unfrozen") && !faux) throw new Fatal(`study files changed since freeze: ${frozen.diff.join(", ")} (refreeze, or pass --unfrozen to record it)`);
+	return frozen;
+}
 
-// ---------- commands ----------
+// ---------- commands: preparation ----------
 
 async function design() {
-	if (!cfg.designer || !cfg.target) throw new Fatal("config needs designer and target");
+	const blind = flag("blind");
+	if (!cfg.designer) throw new Fatal("config needs designer");
+	const arm = opt("arm", "");
+	const source = blind ? cfg.domain : arm ? armTarget(arm) : cfg.target;
+	if (!source) throw new Fatal(blind ? "design --blind needs domain (the area, no destination)" : "config needs target");
+	if (blind && !cfg.designer.blindInstructions) throw new Fatal("design --blind needs designer.blindInstructions");
 	await preflight([cfg.designer.model]);
 	const { harness } = await open(at(`${cfg.runsDir}/${cfg.name}-design${faux ? "-faux" : ""}.sqlite`));
-	const c = await named(harness, "designer", agentFor(cfg.designer));
-	const out = await ask(c, `design:${sha(text(cfg.target)).slice(0, 12)}`, stripComments(text(cfg.target)));
-	const file = at(`${cfg.runsDir}/questions.draft.md`);
+	const role = blind ? { ...cfg.designer, instructions: cfg.designer.blindInstructions } : cfg.designer;
+	const c = await named(harness, blind ? "designer-blind" : "designer", agentFor(role));
+	const out = await ask(c, `design:${blind ? "blind:" : ""}${sha(text(source)).slice(0, 12)}`, clean(source));
+	const file = at(`${cfg.runsDir}/questions${blind ? "-blind" : arm ? `-${arm}` : ""}.draft.md`);
 	writeFileSync(file, out + "\n");
-	console.log(`draft written to ${file}\nedit it, save as your arm's step file, then: node rer.ts freeze ${configArg}`);
+	console.log(`draft written to ${file}\nedit it, save it as an arm's step file, then: node rer.ts freeze ${configArg}`);
 	await close(harness);
 }
 
 function freeze() {
-	const record = { frozenAt: new Date().toISOString(), versions: versions(), files: fingerprint() };
+	if (!cfg.analysis) console.warn("warning: no analysis plan (config.analysis); write one before freezing, or the metrics stay open after the results are in");
+	const record = { frozenAt: new Date().toISOString(), versions: versions(), analysis: cfg.analysis ?? null, files: fingerprint() };
 	writeFileSync(freezeFile(), JSON.stringify(record, null, 2) + "\n");
 	console.log(`froze ${Object.keys(record.files).length} files into ${relative(process.cwd(), freezeFile())}; commit it before running:`);
 	for (const [f, h] of Object.entries(record.files)) console.log(`  ${h.slice(0, 12)}  ${f}`);
@@ -618,10 +806,9 @@ const guessFile = (arm: string) => at(`${cfg.runsDir}/${cfg.name}-${arm}-guesses
 async function guess(arm: string) {
 	const g = cfg.guessers;
 	if (!g) throw new Fatal("config needs guessers");
-	if (!cfg.arms[arm]) throw new Fatal(`unknown arm ${arm}`);
 	await preflight(g.models);
-	const qs = steps(cfg.arms[arm]);
-	const prompt = stripComments(text(g.prompt)).trim();
+	const qs = armSteps(arm).map((s) => s.text);
+	const prompt = clean(g.prompt);
 	const { harness } = await open(at(`${cfg.runsDir}/${cfg.name}-${arm}-guess${faux ? "-faux" : ""}.sqlite`));
 	const lines: string[] = [];
 	const orders: Record<string, string[]> = { path: qs };
@@ -639,23 +826,73 @@ async function guess(arm: string) {
 					console.log(`  guess ${arm} ${order} ${model} k=${k} r=${r}`);
 				}
 	writeFileSync(guessFile(arm), lines.join("\n") + "\n");
-	console.log(`guesses in ${guessFile(arm)}; score them blind (0 unrelated, 1 same area, 2 identifies the target)`);
+	console.log(`guesses in ${guessFile(arm)}; score them with: node rer.ts score-guesses ${configArg}`);
 	await close(harness);
 }
 
-function seededShuffle<T>(list: T[], seed: string): T[] {
-	const a = [...list];
-	let s = parseInt(seed.slice(0, 8), 16);
-	for (let i = a.length - 1; i > 0; i--) {
-		s = (s * 1664525 + 1013904223) >>> 0;
-		const j = s % (i + 1);
-		[a[i], a[j]] = [a[j], a[i]];
+/** Scorers see the arm's target and one guess at a time: never the arm, the order, the cutoff, or the questions. Every
+ *  guess of every arm is shuffled together; the mapping is a separate file. Writes the leakage curve per arm. */
+async function scoreGuesses() {
+	const g = cfg.guessers;
+	if (!g?.scorers?.length || !g.scoreRubric) throw new Fatal("score-guesses needs guessers.scorers and guessers.scoreRubric");
+	await preflight(g.scorers);
+	const arms = (cfg.auto?.arms ?? Object.keys(cfg.arms)).filter((a) => existsSync(guessFile(a)));
+	if (!arms.length) throw new Fatal("no guesses yet; run guess (or auto) first");
+	const items = arms.flatMap((arm) => readFileSync(guessFile(arm), "utf8").trim().split("\n").map((l) => JSON.parse(l)))
+		.map((x) => ({ ...x, id: sha(`${x.arm}|${x.order}|${x.model}|${x.k}|${x.repeat}`).slice(0, 12) }));
+	const dir = at(`${cfg.runsDir}/${cfg.name}-leakage${faux ? "-faux" : ""}`);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "key.json"), JSON.stringify(Object.fromEntries(items.map((x) => [x.id, { arm: x.arm, order: x.order, model: x.model, k: x.k, repeat: x.repeat }])), null, 2));
+	const { harness } = await open(join(dir, "scoring.sqlite"));
+	const rubric = clean(g.scoreRubric);
+	const rows: (string | number)[][] = [["arm", "order", "k", "model", "repeat", "scorer", "score", "why"]];
+	setStatus({ phase: "score-guesses" });
+	for (const x of seededShuffle(items, sha(`${cfg.name}:score`)))
+		for (const scorer of g.scorers) {
+			const target = targetText(x.arm) ?? "";
+			const c = await named(harness, `score:${scorer}:${x.id}`, agentFor({ model: scorer, thinking: g.thinking }, `${rubric}\n\nThe target:\n\n${target}`));
+			const j = await askJson(c, `score:${x.id}`, `The guess:\n\n${x.answer}`);
+			rows.push([x.arm, x.order, x.k, x.model, x.repeat, scorer, Number(j.score ?? NaN), String(j.why ?? j.error ?? "")]);
+		}
+	writeFileSync(join(dir, "leakage.csv"), csv(rows));
+
+	// Curve: mean score per arm × order × k; leak point: first k with mean ≥ threshold; agreement between scorers.
+	const data = rows.slice(1).map((r) => ({ arm: String(r[0]), order: String(r[1]), k: Number(r[2]), model: String(r[3]), repeat: Number(r[4]), scorer: String(r[5]), score: Number(r[6]) }));
+	const threshold = g.leakThreshold ?? 1.5;
+	const lines = [`# Leakage curve: ${cfg.name}`, "", `Mean score (0 unrelated, 1 same area, 2 identifies the target) per arm and cutoff k. Leak point: first k with mean ≥ ${threshold}.`, ""];
+	const groups = [...new Set(data.map((d) => `${d.arm}|${d.order}`))].sort();
+	const ks = [...new Set(data.map((d) => d.k))].sort((a, b) => a - b);
+	lines.push(`| arm | order | ${ks.map((k) => `k=${k}`).join(" | ")} | leak point |`, `|---|---|${ks.map(() => "---").join("|")}|---|`);
+	for (const gkey of groups) {
+		const [arm, order] = gkey.split("|");
+		const means = ks.map((k) => {
+			const s = data.filter((d) => d.arm === arm && d.order === order && d.k === k && !Number.isNaN(d.score)).map((d) => d.score);
+			return s.length ? s.reduce((a, b) => a + b, 0) / s.length : NaN;
+		});
+		const leak = ks.find((k, i) => means[i] >= threshold);
+		lines.push(`| ${arm} | ${order} | ${means.map((m) => (Number.isNaN(m) ? "–" : m.toFixed(2))).join(" | ")} | ${leak ?? "none"} |`);
 	}
-	return a;
+	if (g.scorers.length >= 2) {
+		const [a, b] = g.scorers;
+		const byItem = (s: string) => new Map(data.filter((d) => d.scorer === s).map((d) => [`${d.arm}|${d.order}|${d.model}|${d.k}|${d.repeat}`, d.score]));
+		const A = byItem(a), B = byItem(b);
+		const pairs = [...A.keys()].filter((k) => B.has(k)).map((k) => [A.get(k)!, B.get(k)!]).filter(([x, y]) => !Number.isNaN(x) && !Number.isNaN(y));
+		const agree = pairs.filter(([x, y]) => x === y).length / (pairs.length || 1);
+		const cats = [0, 1, 2];
+		const pe = cats.reduce((s, c) => s + (pairs.filter(([x]) => x === c).length / (pairs.length || 1)) * (pairs.filter(([, y]) => y === c).length / (pairs.length || 1)), 0);
+		const kappa = pe === 1 ? 1 : (agree - pe) / (1 - pe);
+		lines.push("", `Scorer agreement (${a} vs ${b}, ${pairs.length} guesses): ${(agree * 100).toFixed(0)}% exact, Cohen's κ = ${kappa.toFixed(2)}.`);
+	}
+	writeFileSync(join(dir, "leakage.md"), lines.join("\n") + "\n");
+	console.log(lines.join("\n"));
+	console.log(`\nwritten to ${dir}`);
+	await close(harness);
 }
 
+// ---------- commands: running ----------
+
 function runId(arm: string, run: string) {
-	if (!cfg.arms[arm]) throw new Fatal(`unknown arm ${arm}; config has ${Object.keys(cfg.arms).join(", ")}`);
+	armSpec(arm);
 	const id = `${cfg.name}-${arm}-${run}`;
 	// Neutral directory name: nothing about the study, the arm, or the target reaches the doer through its cwd.
 	const workdir = resolve(at(cfg.workdir), `p${sha(id).slice(0, 8)}`);
@@ -665,12 +902,11 @@ function runId(arm: string, run: string) {
 
 async function run(arm: string, runNo: string) {
 	const { id, workdir, db, doneFile } = runId(arm, runNo);
-	const frozen = checkFrozen();
-	if (!frozen.frozen && !flag("unfrozen") && !faux) throw new Fatal(`study files changed since freeze: ${frozen.diff.join(", ")} (refreeze, or pass --unfrozen to record it)`);
-	await preflight([cfg.doer.model, ...(cfg.observers ?? []).map((o) => o.model)]);
+	const frozen = requireFrozen();
+	const warnings = await preflight([cfg.doer.model, ...(cfg.observers ?? []).map((o) => o.model), ...(cfg.library ? [cfg.library.model] : [])]);
 	mkdirSync(workdir, { recursive: true });
 	console.log(`workdir ${workdir}`);
-	setStatus({ phase: "isolation", arm, run: runNo, id });
+	setStatus({ phase: "isolation", arm, run: runNo, id, step: undefined, of: undefined, key: undefined });
 	if (cfg.sandbox?.start) {
 		const started = spawnSync(at(cfg.sandbox.start), [workdir, cfg.sandbox.container ?? "rer-sandbox"], { stdio: "inherit" });
 		if (started.status !== 0) throw new Error(`sandbox start failed (exit ${started.status})`);
@@ -681,35 +917,38 @@ async function run(arm: string, runNo: string) {
 	if (!iso.shellWorks) throw new Fatal("the doer's shell does not run in the workdir (is the sandbox container up? sandbox/start.sh <workdir>)");
 	if (!iso.isolated && !flag("allow-leaks") && !faux) throw new Fatal("isolation canary failed; fix the sandbox or pass --allow-leaks to record it");
 
-	const pushes = pushBank();
-	const pick = (pid: string) => {
-		if (!pushes[pid]) throw new Fatal(`push "${pid}" not in ${cfg.pushes}`);
-		return pushes[pid];
-	};
-	const plan = [
-		...steps(cfg.arms[arm]).map((t, i) => ({ key: `q${i + 1}`, text: t, entry: undefined as any })),
+	const plan: Step[] = [
+		...armSteps(arm),
 		...(cfg.afterPath ?? []).map((pid, i) => ({ key: `open${i + 1}`, text: pick(pid), entry: { kind: "rer.push", data: { id: pid, phase: "open" } } })),
 	];
 	(cfg.autoPushes ?? []).forEach(pick);
+	if (cfg.budget?.stallPush) pick(cfg.budget.stallPush);
 	const net: Network = cfg.networkByArm?.[arm] ?? cfg.network ?? {};
 	const usesNet = net.start === "on" || Object.values(net.schedule ?? {}).includes("on");
-	for (const key of Object.keys(net.schedule ?? {})) if (!plan.some((p) => p.key === key)) throw new Fatal(`network.schedule names step "${key}", which this arm does not have (${plan.map((p) => p.key).join(", ")})`);
+	const keys = plan.map((p) => p.key);
+	for (const key of Object.keys(net.schedule ?? {})) if (!keys.includes(key)) throw new Fatal(`network.schedule names step "${key}", which this arm does not have (${keys.join(", ")})`);
+	if (cfg.library?.fromStep && !keys.includes(cfg.library.fromStep)) throw new Fatal(`library.fromStep "${cfg.library.fromStep}" is not a step of this arm`);
 	Object.values(net.announce ?? {}).forEach((pid) => pid && pick(pid));
 
 	const { harness, registry } = await open(db);
 	const guardExt = guard(workdir);
 	registry.install(guardExt);
+	const libraryExt = cfg.library ? libraryTool(harness) : undefined;
+	if (libraryExt) registry.install(libraryExt);
 	const doer = await named(harness, "doer", {
 		model: ref(cfg.doer.model),
 		thinkingLevel: (cfg.doer.thinking ?? "xhigh") as any,
-		extensions: [CodingTools, guardExt],
+		extensions: [CodingTools, guardExt, ...(libraryExt && !cfg.library!.fromStep ? [libraryExt] : [])],
 		instructions: instructions(cfg.doer),
 		cwd: workdir,
 	});
 	const write = (requestId: string, kind: string, data: object) => doer.submit({ type: "write", requestId, entry: { kind, data } } as any, ctx);
+	const history = await entries(doer);
+	const firstStart = Date.parse((history.find((e) => e.kind === "rer.session")?.data as any)?.startedAt ?? new Date().toISOString());
 	await write(`meta:${Date.now()}`, "rer.session", {
 		arm, run: runNo, startedAt: new Date().toISOString(), faux, frozen: frozen.frozen, frozenDiff: frozen.diff,
-		isolation: iso, versions: versions(), files: fingerprint(), config: cfg,
+		isolation: iso, versions: versions(), files: fingerprint(), config: cfg, warnings,
+		steps: plan.map((s) => ({ key: s.key, sha: sha(s.text).slice(0, 12), entry: s.entry?.kind ?? null })),
 	});
 
 	const observeExt = cfg.observerTools === false ? undefined : observeTools(async () => doer, workdir);
@@ -718,13 +957,15 @@ async function run(arm: string, runNo: string) {
 	const ordered = [...(cfg.observers ?? [])].sort((a, b) => Number(!!a.informed) - Number(!!b.informed));
 	const observers = [];
 	for (const o of ordered) {
-		const extra = o.informed && cfg.target ? fill(T.informedTarget, { target: stripComments(text(cfg.target)).trim() }) : undefined;
+		const target = targetText(arm);
+		const extra = o.informed && target ? fill(T.informedTarget, { target }) : undefined;
 		observers.push({ o, c: await named(harness, `observer:${o.name}`, agentFor(o, extra, observeExt)) });
 	}
 
 	const inbox = at(cfg.inbox ?? `${cfg.runsDir}/inbox-${id}`);
 	mkdirSync(`${inbox}/done`, { recursive: true });
 	mkdirSync(`${inbox}/rejected`, { recursive: true });
+
 	// The doer's internet. Every change is recorded with who made it and whether the internet was then reachable.
 	let netState: "on" | "off" = "off";
 	const switchNetwork = async (to: "on" | "off", source: string, step?: string) => {
@@ -740,7 +981,7 @@ async function run(arm: string, runNo: string) {
 	const announcement = (to: "on" | "off") => (net.announce?.[to] ? pick(net.announce[to]!) : undefined);
 	{
 		// Resume where the record says the internet was; a fresh run starts as configured.
-		const last = [...(await entries(doer))].reverse().find((e) => e.kind === "rer.network");
+		const last = [...history].reverse().find((e) => e.kind === "rer.network");
 		const restore = (last?.data as any)?.state ?? net.start ?? "off";
 		if (restore === "on" || usesNet) await switchNetwork(restore, last ? "resume" : "start");
 	}
@@ -763,9 +1004,9 @@ async function run(arm: string, runNo: string) {
 				}
 				// A person chose the timing, so it is an intervention; the announcement text itself is frozen.
 				await switchNetwork(to, "human");
-				const text = announcement(to);
-				const data = { type: "network", state: to, file: f, announced: !!text };
-				if (text) await doer.submit({ type: "input", content: text, whenBusy: "steer", requestId: `int:${f}`, entry: { kind: "rer.intervention", data } } as any, ctx);
+				const said = announcement(to);
+				const data = { type: "network", state: to, file: f, announced: !!said };
+				if (said) await doer.submit({ type: "input", content: said, whenBusy: "steer", requestId: `int:${f}`, entry: { kind: "rer.intervention", data } } as any, ctx);
 				else await write(`int:${f}`, "rer.intervention", data);
 				renameSync(join(inbox, f), join(inbox, "done", f));
 				continue;
@@ -800,17 +1041,67 @@ async function run(arm: string, runNo: string) {
 		writeFileSync(join(dir, `${Date.now()}-live.txt`), message.trim() + "\n");
 		return true;
 	};
-	const budget = async () => {
+
+	// Limits. Activity is any event from the doer's conversation (streamed thinking, text, tool output), so a long
+	// computation that prints or a model that thinks is not a stall; a silent hung command is.
+	let lastActivity = Date.now();
+	let lastEvent = "start";
+	let turn = { step: "", rid: "" };
+	const activity = await watchEvents(harness, doer.id, ctx);
+	activity.start(async (events) => {
+		lastActivity = Date.now();
+		lastEvent = events[events.length - 1]?.type ?? lastEvent;
+	});
+	const limits = async () => {
 		const spent = await costUsd(harness);
 		const tokens = await tokensUsed(harness);
-		setStatus({ usd: Number(spent.toFixed(4)), tokens });
-		const over = cfg.budget?.maxUsd && spent >= cfg.budget.maxUsd ? `$${spent.toFixed(2)} of $${cfg.budget.maxUsd}`
-			: cfg.budget?.maxTokens && tokens >= cfg.budget.maxTokens ? `${tokens} of ${cfg.budget.maxTokens} tokens` : undefined;
+		const minutes = (Date.now() - firstStart) / 60_000;
+		setStatus({ usd: Number(spent.toFixed(4)), tokens, minutes: Math.round(minutes) });
+		const b = cfg.budget ?? {};
+		const over = b.maxUsd && spent >= b.maxUsd ? `$${spent.toFixed(2)} of $${b.maxUsd}`
+			: b.maxTokens && tokens >= b.maxTokens ? `${tokens} of ${b.maxTokens} tokens`
+			: b.maxWallMinutes && minutes >= b.maxWallMinutes ? `wall clock, ${minutes.toFixed(1)} of ${b.maxWallMinutes} min` : undefined;
 		if (over) {
 			await doer.abort(ctx);
-			throw new BudgetReached(`budget reached (${over})`);
+			throw new RunEnded(`budget reached (${over})`);
+		}
+		const quiet = (Date.now() - lastActivity) / 60_000;
+		if (b.stallMinutes && turn.rid && quiet >= b.stallMinutes) {
+			await write(`stall:${turn.rid}`, "rer.stall", { step: turn.step, rid: turn.rid, minutes: Number(quiet.toFixed(1)), lastEvent, at: new Date().toISOString() });
+			console.log(`  stalled in ${turn.step}: no activity for ${quiet.toFixed(1)} min`);
+			notify(`${id}: stalled in ${turn.step}`);
+			await doer.abort(ctx);
+			throw new Stall();
 		}
 	};
+	const during = async () => (await pollInbox(), await limits());
+	const stallsIn = async (step: string) => (await entries(doer)).filter((e) => e.kind === "rer.stall" && (e.data as any)?.step === step);
+
+	/** One doer turn within a step. A stall aborts it and sends the frozen stall push once, as the same automatic,
+	 *  arm-invariant intervention in every arm; a second stall in the same step ends the run as "stalled". */
+	const doerAsk = async (step: string, rid: string, content: string, extra: object) => {
+		turn = { step, rid };
+		lastActivity = Date.now();
+		if (!(await stallsIn(step)).some((s) => (s.data as any).rid === rid)) {
+			try {
+				await ask(doer, rid, content, extra, during);
+				return;
+			} catch (e) {
+				if (!(e instanceof Stall)) throw e;
+			}
+		}
+		const push = cfg.budget?.stallPush;
+		if (!push || (await stallsIn(step)).length >= 2) throw new RunEnded(`stalled in ${step}`);
+		turn = { step, rid: `${rid}:stall` };
+		lastActivity = Date.now();
+		try {
+			await ask(doer, `${rid}:stall`, pick(push), { entry: { kind: "rer.push", data: { id: push, auto: true, reason: "stall" } } }, during);
+		} catch (e) {
+			if (e instanceof Stall) throw new RunEnded(`stalled in ${step}`);
+			throw e;
+		}
+	};
+
 	const stopLive = startLive(harness, { doer, ...Object.fromEntries(observers.map(({ o, c }) => [`observer:${o.name}`, c])) }, say);
 	console.log(`run ${id}: ${plan.length} steps\ndrop a .txt into ${inbox} to intervene ("@push <id>" for a menu push, anything else is free and marks the run); observers: ${inbox}/observer-<name>/`);
 	notify(`run ${id} started`);
@@ -820,22 +1111,30 @@ async function run(arm: string, runNo: string) {
 		for (const [i, step] of plan.entries()) {
 			console.log(`step ${i + 1}/${plan.length} (${step.key})`);
 			setStatus({ phase: "doer", step: i + 1, of: plan.length, key: step.key });
-			await budget();
+			turn = { step: step.key, rid: "" };
+			await limits();
 			await pollInbox(); // also between steps, not only while the doer is busy
+			if (libraryExt && cfg.library!.fromStep === step.key && !(await doer.agent(ctx)).extensions.some((x: any) => x.name === "rer.library")) {
+				await doer.configure({ extensions: { add: [libraryExt] } } as any, ctx);
+				await write(`library-open:${step.key}`, "rer.library-open", { step: step.key, at: new Date().toISOString() });
+				console.log(`  library open from ${step.key}`);
+			}
 			const scheduled = net.schedule?.[step.key];
-			let text = step.text;
+			let content = step.text;
 			if (scheduled && scheduled !== netState) {
 				await switchNetwork(scheduled, "schedule", step.key);
 				const said = announcement(scheduled);
-				if (said) text = `${said}\n\n${step.text}`;
+				if (said) content = `${said}\n\n${step.text}`;
 			}
-			await ask(doer, step.key, text, step.entry ? { entry: step.entry } : {}, async () => (await pollInbox(), await budget()));
+			await doerAsk(step.key, step.key, content, step.entry ? { entry: step.entry } : {});
 			for (const [j, pid] of (cfg.autoPushes ?? []).entries())
-				await ask(doer, `${step.key}:push${j}`, pick(pid), { entry: { kind: "rer.push", data: { id: pid, auto: true } } }, async () => (await pollInbox(), await budget()));
+				await doerAsk(step.key, `${step.key}:push${j}`, pick(pid), { entry: { kind: "rer.push", data: { id: pid, auto: true } } });
+			turn = { step: step.key, rid: "" };
 			await write(`mark:${step.key}`, "rer.step", { key: step.key, index: i });
 
 			// Observers read what the doer did in this step. Nothing flows back to the doer.
 			setStatus({ phase: "observers" });
+			observingStep = step.key;
 			const all = await entries(doer);
 			const mark = (key?: string) => all.findIndex((e) => e.kind === "rer.step" && (e.data as any)?.key === key);
 			const digest = capTotal(render(all.slice(i ? mark(plan[i - 1].key) + 1 : 0, mark(step.key))));
@@ -849,60 +1148,257 @@ async function run(arm: string, runNo: string) {
 			notify(`${id}: step ${i + 1}/${plan.length} done`);
 		}
 	} catch (e) {
-		if (!(e instanceof BudgetReached)) throw e;
+		if (!(e instanceof RunEnded)) throw e;
 		ending = e.message;
 		console.log(ending);
 	} finally {
 		stopLive();
+		await activity.stop().catch(() => {});
 	}
 	const usd = await costUsd(harness);
-	await write(`done:${ending === "completed" ? "ok" : "budget"}`, "rer.done", { at: new Date().toISOString(), usd, ending });
-	writeFileSync(doneFile, JSON.stringify({ id, ending, usd, at: new Date().toISOString() }, null, 2) + "\n");
+	const kind = ending === "completed" ? "ok" : ending.startsWith("stalled") ? "stalled" : "budget";
+	await write(`done:${kind}`, "rer.done", { at: new Date().toISOString(), usd, ending });
+	writeFileSync(doneFile, JSON.stringify({ id, arm, run: runNo, ending, usd, at: new Date().toISOString() }, null, 2) + "\n");
 	setStatus({ phase: "run done", ending });
 	notify(`run ${id} ${ending}, $${usd.toFixed(2)}`);
 	console.log(`done (${ending}). $${usd.toFixed(2)} spent.`);
 	await close(harness);
 }
 
+// ---------- commands: after a run ----------
+
 async function exportRun(arm: string, runNo: string) {
-	const { id, db, exportDir } = runId(arm, runNo);
+	const { id, db, exportDir, workdir } = runId(arm, runNo);
 	if (!existsSync(db)) throw new Fatal(`no run ${id} at ${db}`);
 	const { harness } = await open(db);
 	mkdirSync(exportDir, { recursive: true });
+	const ledger: any[] = [];
 	const dump = async (name: string) => {
 		const c = await lookup(harness, name);
-		if (!c) return;
-		const md = (await entries(c)).flatMap((e) => {
+		if (!c) return [];
+		const all = await entries(c);
+		const md = all.flatMap((e) => {
+			if (e.kind === "rer.pilot") return (writeFileSync(`${exportDir}/pilot.md`, String((e.data as any).content)), [`> **rer.pilot** \`${(e.data as any).file}\` (see pilot.md)`]);
+			if (e.kind === "rer.ledger") ledger.push({ observer: name.replace("observer:", ""), ...(e.data as any) });
 			if (!e.model) return [`> **${e.kind}** \`${JSON.stringify(e.data)}\``];
 			const body = render([e], { includeThinking: true, maxToolChars: 0, user: "**→**" });
 			return body ? [`_${e.kind}_\n\n${body}`] : [];
 		});
 		writeFileSync(`${exportDir}/${name.replace(/:/g, "-")}.md`, md.join("\n\n---\n\n") + "\n");
+		return all;
 	};
-	await dump("doer");
+	const doerEntries = await dump("doer");
 	for (const o of cfg.observers ?? []) await dump(`observer:${o.name}`);
 	writeFileSync(`${exportDir}/usage.json`, JSON.stringify(await harness.usage(ctx), null, 2));
+
+	// The workdir as it ended: every file with size and hash, so judges and readers can check cited files exist.
+	const files = existsSync(workdir) ? listFiles(workdir).map((f) => ({ path: relative(workdir, f), size: statSync(f).size, sha256: sha(readFileSync(f)) })) : [];
+	writeFileSync(`${exportDir}/files.json`, JSON.stringify(files, null, 2));
+
+	// Idea ledger and the path release point: the first step from which ideas originating with the doer are the
+	// majority of new ideas in every later step that has any.
+	writeFileSync(`${exportDir}/ledger.csv`, csv([["observer", "step", "idea", "origin", "evidence", "status"], ...ledger.map((r) => [r.observer, r.step, r.idea, r.origin, r.evidence, r.status])]));
+	const stepOrder = doerEntries.filter((e) => e.kind === "rer.step").map((e) => (e.data as any).key as string);
+	const share = stepOrder.map((s) => {
+		const rows = ledger.filter((r) => r.step === s);
+		return { step: s, ideas: rows.length, doer: rows.length ? rows.filter((r) => r.origin === "doer").length / rows.length : null };
+	});
+	const release = share.find((x, i) => x.doer !== null && x.doer > 0.5 && share.slice(i).every((y) => y.doer === null || y.doer > 0.5))?.step ?? null;
+	const kinds = (k: string) => doerEntries.filter((e) => e.kind === k);
+	const summary = {
+		id, arm, run: runNo,
+		ending: (kinds("rer.done").pop()?.data as any)?.ending ?? "unfinished",
+		pilot: kinds("rer.pilot").length > 0,
+		contaminated: kinds("rer.contaminated").length > 0,
+		interventions: kinds("rer.intervention").map((e) => (e.data as any).type),
+		stalls: kinds("rer.stall").map((e) => (e.data as any).step),
+		retries: kinds("rer.retry").length,
+		restarts: Math.max(0, kinds("rer.session").length - 1),
+		network: kinds("rer.network").map((e) => ({ state: (e.data as any).state, source: (e.data as any).source, step: (e.data as any).step })),
+		library: { questions: kinds("rer.library").length, opened: (kinds("rer.library-open")[0]?.data as any)?.step ?? null },
+		warnings: (kinds("rer.session")[0]?.data as any)?.warnings ?? [],
+		ledger: { ideas: ledger.length, byStep: share, releasePoint: release },
+		usd: await costUsd(harness),
+		tokens: await tokensUsed(harness),
+	};
+	writeFileSync(`${exportDir}/summary.json`, JSON.stringify(summary, null, 2) + "\n");
 	console.log(`exported to ${exportDir} (raw: ${db})`);
 	await close(harness);
 }
 
+/** Keep a pilot transcript in the record as run 0: same storage, marked rer.pilot, never judged or counted. */
+async function importPilot() {
+	const file = positional[2];
+	if (!file || !existsSync(file)) throw new Fatal("usage: node rer.ts import-pilot <config> <transcript file> [--arm X]");
+	const arm = opt("arm", Object.keys(cfg.arms)[0]);
+	const { id, db, doneFile } = runId(arm, "0");
+	const { harness } = await open(db);
+	const doer = await named(harness, "doer", { model: ref(cfg.doer.model), thinkingLevel: (cfg.doer.thinking ?? "xhigh") as any, extensions: [], tools: [] });
+	const content = readFileSync(file, "utf8");
+	await doer.submit({ type: "write", requestId: "pilot", entry: { kind: "rer.pilot", data: { file: basename(file), sha256: sha(content), content, importedAt: new Date().toISOString() } } } as any, ctx);
+	await doer.submit({ type: "write", requestId: "done:pilot", entry: { kind: "rer.done", data: { ending: "pilot" } } } as any, ctx);
+	writeFileSync(doneFile, JSON.stringify({ id, arm, run: "0", ending: "pilot", at: new Date().toISOString() }, null, 2) + "\n");
+	console.log(`pilot kept as ${id} (excluded from judging and analysis)`);
+	await close(harness);
+}
+
+/** Blind judging. Packets hold the doer's final answer and its result files, never the questions or pushes, with
+ *  leak terms and the workdir path redacted; labels are random and the key is a separate file. Blind judges score a
+ *  fixed rubric; one informed judge scores only distance to the target. `--unblind` joins the key afterwards. */
+async function judge() {
+	const j = cfg.judge;
+	if (!j) throw new Fatal("config needs judge");
+	const dir = at(`${cfg.runsDir}/${cfg.name}-judge${faux ? "-faux" : ""}`);
+	if (flag("unblind")) return unblind(dir);
+	await preflight([...j.blind, ...(j.informed ? [j.informed] : [])]);
+	const runs = readdirSync(at(cfg.runsDir)).filter((f) => f.endsWith(faux ? "-faux.done.json" : ".done.json") && (faux || !f.endsWith("-faux.done.json")))
+		.map((f) => JSON.parse(readFileSync(join(at(cfg.runsDir), f), "utf8"))).filter((d) => d.run !== "0" && d.arm && cfg.arms[d.arm]);
+	if (!runs.length) throw new Fatal("no finished runs to judge");
+	mkdirSync(join(dir, "packets"), { recursive: true });
+	const keyFile = join(dir, "key.json");
+	const key: Record<string, { arm: string; run: string; redactions: number }> = existsSync(keyFile) ? JSON.parse(readFileSync(keyFile, "utf8")) : {};
+	const known = new Set(Object.values(key).map((k) => `${k.arm}|${k.run}`));
+	for (const r of runs) {
+		if (known.has(`${r.arm}|${r.run}`)) continue;
+		const label = `P-${randomBytes(3).toString("hex")}`;
+		const { packet, redactions } = await buildPacket(r.arm, r.run);
+		writeFileSync(join(dir, "packets", `${label}.md`), packet);
+		key[label] = { arm: r.arm, run: r.run, redactions };
+	}
+	writeFileSync(keyFile, JSON.stringify(key, null, 2));
+	const { harness } = await open(join(dir, "judging.sqlite"));
+	const rubric = clean(j.rubric);
+	const rows: (string | number)[][] = [["label", "judge", "role", "field", "value"]];
+	setStatus({ phase: "judge" });
+	// Random order, so no judge sees the arms in a pattern; the order is reproducible from the study name.
+	for (const label of seededShuffle(Object.keys(key).sort(), sha(`${cfg.name}:judge`))) {
+		const packet = readFileSync(join(dir, "packets", `${label}.md`), "utf8");
+		for (const model of j.blind) {
+			const c = await named(harness, `judge:${model}:${label}`, agentFor({ model, thinking: j.thinking }, rubric));
+			const out = await askJson(c, `judge:${label}`, packet);
+			for (const [f, v] of Object.entries(out)) rows.push([label, model, "blind", f, typeof v === "object" ? JSON.stringify(v) : String(v)]);
+		}
+		if (j.informed && j.distanceRubric) {
+			const target = targetText(key[label].arm) ?? "";
+			const c = await named(harness, `distance:${j.informed}:${label}`, agentFor({ model: j.informed, thinking: j.thinking }, `${clean(j.distanceRubric)}\n\nThe target:\n\n${target}`));
+			const out = await askJson(c, `distance:${label}`, packet);
+			for (const [f, v] of Object.entries(out)) rows.push([label, j.informed, "informed", f, typeof v === "object" ? JSON.stringify(v) : String(v)]);
+		}
+		console.log(`  judged ${label}`);
+	}
+	writeFileSync(join(dir, "judgements.csv"), csv(rows));
+	console.log(`judgements in ${dir}/judgements.csv (labels only). Packets: ${dir}/packets/.
+Spot-check a share of packets yourself into ${dir}/human.csv (label,field,value) before you run: node rer.ts judge ${configArg} --unblind`);
+	await close(harness);
+}
+
+async function buildPacket(arm: string, runNo: string) {
+	const j = cfg.judge!;
+	const { db, workdir } = runId(arm, runNo);
+	const { harness } = await open(db);
+	const doer = await lookup(harness, "doer");
+	const all = doer ? await entries(doer) : [];
+	await close(harness);
+	// The doer's last words: the final assistant entry with text.
+	const final = [...all].reverse().find((e) => e.kind === "pi.assistant" && render([e], { maxToolChars: 0 }).trim());
+	const finalText = final ? render([final], { includeThinking: false, maxToolChars: 0 }) : "(no final answer)";
+	const files = existsSync(workdir) ? listFiles(workdir) : [];
+	const patterns = (j.resultFiles ?? ["README*", "*result*", "*log*.md", "*.md"]).map((p) => new RegExp(`^${p.split("*").map(escapeRe).join(".*")}$`, "i"));
+	const named_ = files.filter((f) => finalText.includes(basename(f)));
+	const matched = files.filter((f) => !named_.includes(f) && patterns.some((re) => re.test(basename(f))));
+	const max = j.maxPacketChars ?? 120_000;
+	let body = `# Final report\n\n${finalText}\n\n# Project files\n\n${files.map((f) => relative(workdir, f)).join("\n") || "(none)"}\n`;
+	for (const f of [...named_, ...matched]) {
+		const t = readable(f);
+		if (t === undefined || body.length > max) continue;
+		body += `\n# File: ${relative(workdir, f)}\n\n${t.slice(0, 20_000)}${t.length > 20_000 ? "\n…[truncated]" : ""}\n`;
+	}
+	body = body.slice(0, max).split(workdir).join("<project>").replace(/\bp[0-9a-f]{8}\b/g, "<project>");
+	const red = redact(body);
+	return { packet: red.text, redactions: red.count };
+}
+
+function unblind(dir: string) {
+	const key = JSON.parse(readFileSync(join(dir, "key.json"), "utf8"));
+	const rows = readFileSync(join(dir, "judgements.csv"), "utf8").trim().split("\n").slice(1).map((l) => parseCsvLine(l));
+	const data = rows.map(([label, judgeModel, role, field, value]) => ({ label, judge: judgeModel, role, field, value: Number(value), arm: key[label]?.arm, run: key[label]?.run })).filter((d) => !Number.isNaN(d.value));
+	const fields = [...new Set(data.map((d) => `${d.role}|${d.field}`))].sort();
+	const arms = [...new Set(data.map((d) => d.arm))].sort();
+	const lines = [`# Blind judgements: ${cfg.name}`, "", "Mean per arm (min–max over runs, each run averaged over judges).", "", `| field | ${arms.join(" | ")} |`, `|---|${arms.map(() => "---").join("|")}|`];
+	for (const fr of fields) {
+		const [role, field] = fr.split("|");
+		const cells = arms.map((arm) => {
+			const perRun = [...new Set(data.filter((d) => d.arm === arm).map((d) => d.run))].map((run) => {
+				const v = data.filter((d) => d.arm === arm && d.run === run && d.role === role && d.field === field).map((d) => d.value);
+				return v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN;
+			}).filter((v) => !Number.isNaN(v));
+			if (!perRun.length) return "–";
+			const mean = perRun.reduce((a, b) => a + b, 0) / perRun.length;
+			return `${mean.toFixed(2)} (${Math.min(...perRun).toFixed(1)}–${Math.max(...perRun).toFixed(1)}, n=${perRun.length})`;
+		});
+		lines.push(`| ${role === "informed" ? `${field} (informed)` : field} | ${cells.join(" | ")} |`);
+	}
+	// Agreement between blind judges, per field: exact agreement and mean absolute difference.
+	const judges = [...new Set(data.filter((d) => d.role === "blind").map((d) => d.judge))];
+	if (judges.length >= 2) {
+		lines.push("", `Agreement between ${judges[0]} and ${judges[1]}:`, "");
+		for (const field of [...new Set(data.filter((d) => d.role === "blind").map((d) => d.field))]) {
+			const a = new Map(data.filter((d) => d.judge === judges[0] && d.field === field).map((d) => [d.label, d.value]));
+			const pairs = data.filter((d) => d.judge === judges[1] && d.field === field && a.has(d.label)).map((d) => [a.get(d.label)!, d.value]);
+			if (!pairs.length) continue;
+			const exact = pairs.filter(([x, y]) => x === y).length / pairs.length;
+			const mad = pairs.reduce((s, [x, y]) => s + Math.abs(x - y), 0) / pairs.length;
+			lines.push(`- ${field}: ${(exact * 100).toFixed(0)}% exact, mean |difference| ${mad.toFixed(2)} (${pairs.length} packets)`);
+		}
+	}
+	const humanFile = join(dir, "human.csv");
+	if (existsSync(humanFile)) {
+		const human = readFileSync(humanFile, "utf8").trim().split("\n").slice(1).map((l) => parseCsvLine(l)).map(([label, field, value]) => ({ label, field, value: Number(value) }));
+		lines.push("", `Your spot-check (${new Set(human.map((h) => h.label)).size} packets) against each blind judge:`, "");
+		for (const jm of judges) {
+			const pairs = human.map((h) => [h.value, data.find((d) => d.judge === jm && d.label === h.label && d.field === h.field)?.value]).filter(([, v]) => v !== undefined) as number[][];
+			if (pairs.length) lines.push(`- ${jm}: ${((pairs.filter(([x, y]) => x === y).length / pairs.length) * 100).toFixed(0)}% exact over ${pairs.length} scores`);
+		}
+	} else lines.push("", "No human spot-check found (human.csv); report that it was not done.");
+	writeFileSync(join(dir, "summary.md"), lines.join("\n") + "\n");
+	console.log(lines.join("\n"));
+}
+function parseCsvLine(line: string): string[] {
+	const out: string[] = [];
+	let cur = "", q = false;
+	for (let i = 0; i < line.length; i++) {
+		const ch = line[i];
+		if (q) {
+			if (ch === '"' && line[i + 1] === '"') (cur += '"'), i++;
+			else if (ch === '"') q = false;
+			else cur += ch;
+		} else if (ch === '"') q = true;
+		else if (ch === ",") out.push(cur), (cur = "");
+		else cur += ch;
+	}
+	out.push(cur);
+	return out;
+}
+
 // ---------- autonomous mode ----------
 
-/** The whole study in one process: guessers per arm, then every run of every arm, alternating arm order so time of day
- *  and provider drift do not line up with one arm. Finished pieces leave a file and are skipped on restart. */
+/** The whole study in one process: guessers per arm, then every run of every arm. Arm order follows a Latin square
+ *  (each run index rotates the arm list by one), so time of day and provider drift do not line up with one arm.
+ *  Finished pieces leave a file and are skipped on restart. */
 async function autoWorker() {
 	const a = cfg.auto ?? {};
 	const arms = a.arms ?? Object.keys(cfg.arms);
-	const frozen = checkFrozen();
-	if (!frozen.frozen && !flag("unfrozen") && !faux) throw new Fatal(`study files changed since freeze: ${frozen.diff.join(", ")}`);
+	requireFrozen();
 	if ((a.guess ?? true) && cfg.guessers) for (const arm of arms) if (!existsSync(guessFile(arm))) await guess(arm);
-	for (let r = 1; r <= (a.runs ?? 1); r++)
-		for (const arm of r % 2 ? arms : [...arms].reverse()) {
+	for (let r = 1; r <= (a.runs ?? 1); r++) {
+		const shift = (r - 1) % arms.length;
+		for (const arm of [...arms.slice(shift), ...arms.slice(0, shift)]) {
 			const { id, doneFile, exportDir } = runId(arm, String(r));
 			if (!existsSync(doneFile)) await run(arm, String(r));
-			if (!existsSync(join(exportDir, "doer.md"))) await exportRun(arm, String(r));
+			if (!existsSync(join(exportDir, "summary.json"))) await exportRun(arm, String(r));
 			console.log(`${id}: finished`);
 		}
+	}
 	setStatus({ phase: "study complete" });
 	notify("study complete");
 }
@@ -934,18 +1430,18 @@ async function supervise() {
 
 /** Which models exist and which have credentials: every model the config uses, then a provider's catalog (--provider). */
 async function listModels() {
-	const used = [cfg.doer, cfg.designer, ...(cfg.observers ?? [])].filter(Boolean).map((r) => r!.model).concat(cfg.guessers?.models ?? []);
 	const authed = new Map<string, boolean>();
 	const hasAuth = async (p: string) => {
 		if (!authed.has(p)) authed.set(p, !!(await models.getAuth(p).catch(() => undefined)));
 		return authed.get(p)!;
 	};
 	console.log("models in this config:");
-	for (const m of [...new Set(used)]) {
+	for (const m of allModels()) {
 		const i = m.indexOf("/");
 		const found = models.getModel(m.slice(0, i), m.slice(i + 1));
 		console.log(`  ${found ? "ok     " : "UNKNOWN"} ${(await hasAuth(m.slice(0, i))) ? "key ok " : "NO KEY "} ${m}`);
 	}
+	for (const w of cutoffWarnings(allModels())) console.log(`  warning: ${w}`);
 	const provider = opt("provider", "");
 	if (provider) {
 		console.log(`\n${provider} catalog (${(await hasAuth(provider)) ? "credentials found" : "no credentials"}):`);
@@ -962,8 +1458,11 @@ const commands: Record<string, () => unknown> = {
 	design,
 	freeze,
 	guess: () => guess(opt("arm", Object.keys(cfg.arms)[0])),
+	"score-guesses": scoreGuesses,
 	run: () => run(opt("arm", Object.keys(cfg.arms)[0]), opt("run", "1")),
 	export: () => exportRun(opt("arm", Object.keys(cfg.arms)[0]), opt("run", "1")),
+	judge,
+	"import-pilot": importPilot,
 };
 if (!commands[command]) {
 	console.error(`unknown command ${command}`);

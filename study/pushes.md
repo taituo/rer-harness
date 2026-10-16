@@ -30,3 +30,9 @@ Heads up: the machine has internet access now. Use it if it helps.
 
 ## net-off
 The machine is offline again from here on.
+
+## stuck
+Your last command seems to have hung for a long time. Check what is actually running, stop anything stuck, and carry on.
+
+## continue
+Keep going. What is the most important next question here? Investigate it properly.
