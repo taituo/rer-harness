@@ -79,6 +79,9 @@ core() {
 	# Issue #3: duplicate tool call ids never reach the provider; observer failures do not stop a run.
 	RER_FAUX_DUP_IDS=1 timeout 300 node rer.ts run $CFG --faux --run dup > $RUNS.dup.log 2>&1
 	check "duplicate tool ids are made unique before each request" "grep -q 'done (completed)' $RUNS.dup.log && ! grep -q DUPLICATE $RUNS.dup.log"
+	check "tool history repair: every case passes pi-ai's Responses conversion strictly" "node test/tool-history.test.ts >/dev/null"
+	RER_FAUX_REUSE_IDS=1 RER_FAUX_API=openai-responses timeout 300 node rer.ts run $CFG --faux --run reuse > $RUNS.reuse.log 2>&1
+	check "a call_id reused across rounds never reaches the provider twice (issue #4)" "grep -q 'done (completed)' $RUNS.reuse.log && ! grep -q DUPLICATE $RUNS.reuse.log && grep -q 'tool history repaired' $RUNS.reuse.log"
 	variant ci-of.json "c['retries']=0; c['modelRetries']=0"
 	RER_FAUX_FAIL_OBSERVERS=1 timeout 300 node rer.ts run $FIX/ci-of.json --faux --run of > $RUNS.of.log 2>&1
 	check "a failing observer is recorded and the run goes on" "grep -q 'done (completed)' $RUNS.of.log && grep -q 'observer A failed' $RUNS.of.log"

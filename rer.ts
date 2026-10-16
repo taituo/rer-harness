@@ -28,11 +28,13 @@ import { Type } from "@earendil-works/pi-ai";
 import { calculateCost } from "@earendil-works/pi-ai/models";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { configure, createRegistry, defineDoc, defineExtension, defineTool, GenerationTask, Harness, hook, ToolTask, watchEvents } from "@earendil-works/pi-durable";
 import type { Conversation, EntryRecord, Submission } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { repairToolHistory, requestShape } from "./tool-history.ts";
 
 const ctx = BACKGROUND_CONTEXT;
 const here = dirname(new URL(import.meta.url).pathname);
@@ -88,6 +90,7 @@ type Config = {
 	library?: { model: string; thinking?: string; instructions?: string; search: string; before?: string; fromStep?: string; maxResults?: number; allowUndated?: boolean };
 	budget?: { maxUsd?: number; maxTokens?: number; maxWallMinutes?: number; stallMinutes?: number; stallPush?: string }; // per run
 	modelRetries?: number; // provider retries inside one model call (no new message to the model)
+	compaction?: { enabled?: boolean; reserveTokens?: number; keepRecentTokens?: number; backgroundTokens?: number }; // Pi's automatic summarizing of long contexts
 	retries?: number; // resubmissions after a call still failed; each is recorded
 	inbox?: string;
 	digest?: { maxToolChars?: number; maxChars?: number; includeThinking?: boolean };
@@ -209,19 +212,29 @@ const models = builtinModels();
 if (faux) {
 	const usdPerMTok = Number(process.env.RER_FAUX_COST ?? 0); // faux-only: make budget limits testable
 	// One fake model per configured model, so per-role usage and the model-mismatch guard behave as in a real run.
-	const f = fauxProvider({ provider: "faux", models: allModels().map(fauxId).map((id) => ({ id, reasoning: true, cost: { input: usdPerMTok, output: usdPerMTok, cacheRead: 0, cacheWrite: 0 } })) as any, tokensPerSecond: Number(process.env.RER_FAUX_TPS ?? 0) || undefined });
+	const f = fauxProvider({ provider: "faux", api: process.env.RER_FAUX_API, models: allModels().map(fauxId).map((id) => ({ id, reasoning: true, contextWindow: Number(process.env.RER_FAUX_CONTEXT ?? 0) || undefined, cost: { input: usdPerMTok, output: usdPerMTok, cacheRead: 0, cacheWrite: 0 } })) as any, tokensPerSecond: Number(process.env.RER_FAUX_TPS ?? 0) || undefined });
 	let n = 0;
 	let scripted = 0; // the doer's scripted calls keep their own order, whatever the observers do
-	const respond = (context: any) => {
+	const respond = (context: any, _options: any, _state: any, model: any) => {
 		const msgs = context.messages ?? [];
 		const last = msgs[msgs.length - 1];
-		// faux-only: behave like a strict OpenAI endpoint and reject duplicate tool result ids
-		const resultIds = msgs.filter((m: any) => m.role === "toolResult").map((m: any) => m.toolCallId);
-		if (new Set(resultIds).size !== resultIds.length) console.error(`[faux] DUPLICATE tool result ids in request: ${resultIds.join(",")}`);
+		// faux-only: convert the request exactly as pi-ai does for the OpenAI Responses API and reject it, as a strict
+		// endpoint would, if any call_id has more than one function_call_output.
+		const items: any[] = convertResponsesMessages(model ?? ({ provider: "faux", api: "openai-responses", id: "m", input: ["text"] } as any), context, new Set(["faux"]));
+		const outputs = new Map<string, number>();
+		for (const it of items) if (it.type === "function_call_output") outputs.set(it.call_id, (outputs.get(it.call_id) ?? 0) + 1);
+		const dups = [...outputs].filter(([, n]) => n > 1).map(([id]) => id);
+		if (dups.length) {
+			console.error(`[faux] DUPLICATE function_call_output for ${dups.join(",")}`);
+			if (process.env.RER_FAUX_DUMP) writeFileSync(process.env.RER_FAUX_DUMP, JSON.stringify({ messages: msgs, items }, null, 1));
+		}
 		const lastUser = [...msgs].reverse().find((m: any) => m.role === "user");
 		const said = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
 		const system = JSON.stringify(msgs.filter((m: any) => m.role === "system"));
 		const tools: string[] = msgs.flatMap((m: any) => (m.role === "system" ? (m.toolsAdded ?? []).map((t: any) => t.name ?? t) : []));
+		// faux-only: RER_FAUX_GATEWAY_REJECT=1 rejects the observer's request after a tool round, as a gateway might
+		if (process.env.RER_FAUX_GATEWAY_REJECT && tools.includes("transcript") && last?.role === "toolResult")
+			return fauxAssistantMessage([], { stopReason: "error", errorMessage: `400 Duplicate function_call_output for call_id '${last.toolCallId}' (faux gateway)` });
 		if (process.env.RER_FAUX_FAIL_OBSERVERS && tools.includes("transcript"))
 			return fauxAssistantMessage([], { stopReason: "error", errorMessage: "400 Duplicate function_call_output (faux)" });
 		if (tools.length && last?.role === "user") {
@@ -231,6 +244,19 @@ if (faux) {
 			const call: [string, any] = tools.includes("bash")
 				? (script ? script[scripted++ % script.length] : ["bash", { command: `echo step ${++n} && pwd && ls` }])
 				: tools.includes("transcript") ? observerCalls[n++ % observerCalls.length] : [tools[0], {}];
+			// faux-only: RER_FAUX_PARALLEL_LEDGER=1 makes observers emit eight parallel ledger calls with Responses-style ids
+			if (process.env.RER_FAUX_PARALLEL_LEDGER && !tools.includes("bash")) {
+				const k = n++;
+				const think = { type: "thinking", thinking: "", thinkingSignature: JSON.stringify({ type: "reasoning", id: `rs_${k}`, summary: [], encrypted_content: "x" }) } as any;
+				const round = msgs.filter((m: any) => m.role === "toolResult").length;
+				const calls = round < 3
+					? [fauxToolCall(["transcript", "transcript", "files"][round], {}, { id: `call_${k}t|fc_${k}t` })]
+					: Array.from({ length: 8 }, (_, i) => fauxToolCall("ledger", { idea: `idea ${k}.${i}`, origin: "doer", evidence: "t", status: "claimed" }, { id: `call_${k}x${i}|fc_${k}x${i}` }));
+				return fauxAssistantMessage([think, ...calls], { stopReason: "toolUse" });
+			}
+			// faux-only: RER_FAUX_REUSE_IDS=1 makes observers reuse one call_id in every round, as some gateways do
+			if (process.env.RER_FAUX_REUSE_IDS && !tools.includes("bash"))
+				return fauxAssistantMessage([fauxToolCall("transcript", { count: 1 }, { id: `call_0|fc_${n++}` }), fauxToolCall("files", {}, { id: `call_1|fc_${n++}` })], { stopReason: "toolUse" });
 			// faux-only: RER_FAUX_DUP_IDS=1 makes observers emit two parallel calls sharing one id, as some models do
 			if (process.env.RER_FAUX_DUP_IDS && !tools.includes("bash"))
 				return fauxAssistantMessage([fauxToolCall("transcript", { count: 1 }, { id: `dup${n}` }), fauxToolCall("files", {}, { id: `dup${n}` })], { stopReason: "toolUse" });
@@ -386,40 +412,27 @@ async function canary(workdir: string) {
 
 // ---------- harness ----------
 
-/** Some models give two parallel tool calls the same id. Pi then sends two results with that id, and strict
- *  OpenAI-compatible endpoints reject the request ("Duplicate function_call_output", issue #3). Before every request,
- *  give each repeated id a unique suffix in both the call and its matching result, in order. Only the request changes;
- *  the stored transcript keeps what the model produced. */
-const UniqueToolIds = defineExtension({
-	name: "rer.unique-tool-ids",
+/** Repairs tool history in every request before it is sent (tool-history.ts, issues #3 and #4), and keeps the shape of
+ *  any request a provider still rejects over tool history (roles and ids, no content) in runs/request-shapes/. */
+const lastShape = new Map<string, unknown>();
+const ToolHistory = defineExtension({
+	name: "rer.tool-history",
 	hooks: [
 		hook(GenerationTask, {
-			beforeRequest: ({ messages }: any) => {
-				const seen = new Map<string, number>();
-				const pending = new Map<string, string[]>();
-				let changed = false;
-				const out = messages.map((m: any) => {
-					if (m.role === "assistant" && Array.isArray(m.content)) {
-						const content = m.content.map((b: any) => {
-							if (b.type !== "toolCall") return b;
-							const n = seen.get(b.id) ?? 0;
-							seen.set(b.id, n + 1);
-							const id = n ? `${b.id}__${n + 1}` : b.id;
-							pending.set(b.id, [...(pending.get(b.id) ?? []), id]);
-							if (id === b.id) return b;
-							changed = true;
-							return { ...b, id };
-						});
-						return content.some((b: any, i: number) => b !== m.content[i]) ? { ...m, content } : m;
-					}
-					if (m.role === "toolResult") {
-						const queue = pending.get(m.toolCallId);
-						const id = queue?.shift();
-						return id && id !== m.toolCallId ? { ...m, toolCallId: id } : m;
-					}
-					return m;
-				});
-				return changed ? { messages: out } : undefined;
+			beforeRequest: ({ messages }: any, api: any) => {
+				const { messages: repaired, report } = repairToolHistory(messages);
+				lastShape.set(String(api.conversationId), { before: requestShape(messages), sent: requestShape(repaired), report });
+				const changed = report.renamed + report.moved + report.droppedResults > 0;
+				if (changed) console.error(`  tool history repaired for conversation ${api.conversationId}: ${JSON.stringify(report)}`);
+				return changed ? { messages: repaired as any } : undefined;
+			},
+			afterResponse: (message: any, api: any) => {
+				if (message?.stopReason !== "error" || !/call_id|function_call|tool_call|tool result|tool_use/i.test(message.errorMessage ?? "")) return;
+				const dir = at(`${cfg.runsDir}/request-shapes`);
+				mkdirSync(dir, { recursive: true });
+				const file = join(dir, `${api.conversationId}-${Date.now()}.json`);
+				writeFileSync(file, JSON.stringify({ error: message.errorMessage, model: `${message.provider}/${message.model}`, ...(lastShape.get(String(api.conversationId)) as object) }, null, 1));
+				console.error(`  provider rejected the tool history; request shape saved to ${file}`);
 			},
 		}),
 	],
@@ -436,7 +449,7 @@ async function open(file: string) {
 	mkdirSync(dirname(file), { recursive: true });
 	const registry = createRegistry();
 	registry.install(CodingTools);
-	registry.install(UniqueToolIds);
+	registry.install(ToolHistory);
 	const harness = await Harness.open(await openNodeSqliteStorage(file), {
 		models,
 		registry,
@@ -444,6 +457,7 @@ async function open(file: string) {
 		settings: {
 			extensions: [],
 			retry: { enabled: true, maxRetries: cfg.modelRetries ?? 8, baseDelayMs: 5000, maxAgentDelayMs: 300_000 },
+			...(cfg.compaction ? { compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000, backgroundTokens: 32768, ...cfg.compaction } } : {}),
 		},
 	} as any, ctx);
 	current = harness;
@@ -485,7 +499,7 @@ async function lookup(harness: Harness, name: string): Promise<Conversation | un
 const agentFor = (r: Role, extra?: string, ext?: any) => ({
 	model: ref(r.model),
 	thinkingLevel: (r.thinking ?? "high") as any,
-	extensions: ext ? [ext, UniqueToolIds] : [],
+	extensions: ext ? [ext, ToolHistory] : [],
 	tools: ext ? undefined : [],
 	instructions: [instructions(r), extra].filter(Boolean).join("\n\n") || undefined,
 });
@@ -798,7 +812,7 @@ function studyFiles(): string[] {
 		const dir = dirname(at(s));
 		for (const f of readdirSync(dir)) if (statSync(join(dir, f)).isFile()) files.add(join(dir, f)); // shell, start, net, Dockerfile
 	}
-	for (const f of ["rer.ts", "live.html", "package-lock.json"]) files.add(join(here, f));
+	for (const f of ["rer.ts", "tool-history.ts", "live.html", "package-lock.json"]) files.add(join(here, f));
 	return [...files].filter(existsSync).sort();
 }
 const fingerprint = () => Object.fromEntries(studyFiles().map((f) => [relative(base, f), sha(readFileSync(f))]));
@@ -997,7 +1011,7 @@ async function run(arm: string, runNo: string) {
 	const doer = await named(harness, "doer", {
 		model: ref(cfg.doer.model),
 		thinkingLevel: (cfg.doer.thinking ?? "xhigh") as any,
-		extensions: [CodingTools, guardExt, UniqueToolIds, ...(libraryExt && !cfg.library!.fromStep ? [libraryExt] : [])],
+		extensions: [CodingTools, guardExt, ToolHistory, ...(libraryExt && !cfg.library!.fromStep ? [libraryExt] : [])],
 		instructions: instructions(cfg.doer),
 		cwd: workdir,
 	});
