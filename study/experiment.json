@@ -18,7 +18,8 @@
     "start": "../sandbox/start.sh",
     "shell": "../sandbox/shell.sh",
     "container": "rer-sandbox",
-    "forbiddenPaths": []
+    "forbiddenPaths": [],
+    "net": "../sandbox/net.sh"
   },
   "doer": {
     "model": "anthropic/claude-opus-5-5",
@@ -88,5 +89,13 @@
     "port": 7777,
     "host": "127.0.0.1"
   },
-  "notify": ""
+  "notify": "",
+  "network": {
+    "start": "off",
+    "schedule": {},
+    "announce": {
+      "on": "net-on",
+      "off": "net-off"
+    }
+  }
 }

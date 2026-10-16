@@ -20,7 +20,8 @@ The design in one paragraph: a **doer** model walks a frozen **question path** t
 4. Never open a run's `.sqlite` while it runs. Watch through `runs/status.json`, the live page or the log.
 5. Intervening on the doer: use `@push <id>` from `study/pushes.md`. Free text contaminates the run; only send it if the human asked, and tell them the run is now marked.
 6. Never give the blind observer information about the target. Messages to it are marked `rer.human-contact`.
-7. Do not interpret results while runs are still going; do not peek at guess scores before all guesses exist.
+7. The researcher's internet is off unless the design says otherwise. Change it only through `network.schedule` in the frozen config, or by hand (`@net on|off`) when the human asks; with it on, the researcher can look up the target, so say so whenever you report those runs.
+8. Do not interpret results while runs are still going; do not peek at guess scores before all guesses exist.
 
 ## Setup
 
@@ -76,6 +77,10 @@ Exit code 3 / phase `stopped: fatal error` means a restart cannot help. The comm
 Doer (from the live page or by file):
 ```bash
 echo "@push deeper" > runs/inbox-<run>/note.txt
+```
+Internet for the researcher, recorded as an intervention:
+```bash
+echo "@net on" > runs/inbox-<run>/net.txt
 ```
 Observer, which never reaches the doer:
 ```bash

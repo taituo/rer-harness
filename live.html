@@ -35,6 +35,7 @@
   form textarea { flex:1; resize:vertical; min-height:36px; max-height:200px; font:inherit; color:var(--ink); background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
   form button { font:inherit; border:0; border-radius:6px; padding:0 12px; background:var(--accent); color:#fff; cursor:pointer; }
   form .hint { display:none; }
+  button.net { font:inherit; font-size:12px; border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:5px; padding:1px 8px; cursor:pointer; }
   .live { opacity:.85; }
   .live::after { content:"▍"; color:var(--accent); animation: b 1s steps(1) infinite; }
   @keyframes b { 50% { opacity:0; } }
@@ -47,6 +48,7 @@
   <span><span class="k">phase</span> <b id="phase">–</b></span>
   <span><span class="k">step</span> <b id="step">–</b></span>
   <span><span class="k">spent</span> <b id="usd">–</b></span>
+  <span><span class="k">researcher's internet</span> <b id="net">off</b> <button class="net" data-net="on">turn on</button> <button class="net" data-net="off">turn off</button></span>
 </header>
 <main id="cols"></main>
 <script>
@@ -165,12 +167,19 @@ function connect() {
     if (d.type === "status") {
       const s = d.status; $("study").textContent = s.study; $("run").textContent = s.id || "–"; $("phase").textContent = s.phase || "–";
       $("step").textContent = s.step ? `${s.step}/${s.of} (${s.key})` : "–"; $("usd").textContent = s.usd !== undefined ? `$${s.usd.toFixed(2)}` : "–";
+      $("net").textContent = s.network || "off";
       (d.conversations || []).forEach(column);
       return;
     }
     for (const ev of d.events) handle(d.conv, ev);
   };
 }
+document.querySelectorAll("button.net").forEach((b) => b.addEventListener("click", async () => {
+  const to = b.dataset.net;
+  if (!confirm(`Turn the researcher's internet ${to}? This is recorded as a human intervention.`)) return;
+  const r = await fetch("/say", { method: "POST", body: JSON.stringify({ to: "doer", text: `@net ${to}` }) });
+  if (!r.ok) alert("Not delivered");
+}));
 connect();
 </script>
 </body>

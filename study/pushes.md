@@ -24,3 +24,9 @@ Keep going on that. Set up a hypothesis you could be wrong about, write down wha
 
 ## open-3
 Where does this leave things? What did you find that nobody would have predicted, and how sure are you? Show me the evidence, not the summary.
+
+## net-on
+Heads up: the machine has internet access now. Use it if it helps.
+
+## net-off
+The machine is offline again from here on.

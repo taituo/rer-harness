@@ -59,6 +59,24 @@ Drop a `.txt` file into the run's inbox (`runs/inbox-<run>/`, printed at start).
 - `@push deeper` sends that push from `pushes.md`. Written in advance and frozen, it carries nothing about the target: the run stays clean. An unknown id is moved to `rejected/` instead of stopping the run.
 - Anything else is free text: delivered, and the run is marked `rer.contaminated` from that point. Analyze those runs separately.
 
+## The researcher's internet
+
+Off by default. You can give it from the start, never, between certain steps, or by hand mid-run, and every change is recorded as `rer.network`: who made it (`start`, `schedule`, `resume`, `human`), before which step, the state Docker reports, and whether the internet was actually reachable.
+
+```json
+"network": {
+  "start": "off",
+  "schedule": { "q8": "on", "q12": "off", "open1": "on" },
+  "announce": { "on": "net-on", "off": "net-off" }
+}
+```
+
+`schedule` keys are step keys (`q1`… for the path, `open1`… for the open phase); the change happens just before that step. `announce` names pushes from `pushes.md` that tell the researcher about the change, so it is not left believing whatever `doer.md` said; on a scheduled change the announcement goes in front of that step's message. `networkByArm` gives one arm its own schedule, for example the same for both arms (fair), or internet only for the control arm.
+
+By hand: the switch in the live page's header, or `echo "@net on" > runs/inbox-<run>/x.txt`. A person chose the timing, so it is recorded as an intervention.
+
+Mechanics: the sandbox starts on an internal Docker network with no route out, and `sandbox/net.sh on|off` attaches or detaches the default bridge. Isolation is always checked with the internet off; after a restart the state is restored from the record. The science costs are real: with the internet on, the researcher can look the target up, so a scheduled "on" belongs in the design and in the paper, and the transcript shows every search it made.
+
 ## Talking to observers
 
 Each column on the live page has a message box. Type to an observer and it answers in its own column, mid-run; nothing you say to an observer ever reaches the researcher. Without the page, drop a `.txt` into `runs/inbox-<run>/observer-<name>/`. Both paths are recorded the same way, as `rer.intervention` entries in that observer's transcript.

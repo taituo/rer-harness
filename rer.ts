@@ -39,6 +39,9 @@ class BudgetReached extends Error {}
 // ---------- config ----------
 
 type Role = { model: string; thinking?: string; instructions?: string };
+/** start: state at the first step. schedule: step key -> state before that step (q1…, open1…). announce: push ids sent
+ *  to the doer when its internet changes, so it is not left believing whatever doer.md said. */
+type Network = { start?: "on" | "off"; schedule?: Record<string, "on" | "off">; announce?: { on?: string; off?: string } };
 type Config = {
 	name: string;
 	runsDir: string;
@@ -48,7 +51,9 @@ type Config = {
 	afterPath?: string[]; // push ids sent as extra steps once the path ends (open phase)
 	target?: string; // the known solution B: only the designer and informed observers see it
 	workdir: string; // base dir; each run gets a neutral subdirectory
-	sandbox?: { start?: string; shell?: string; container?: string; forbiddenPaths?: string[] };
+	sandbox?: { start?: string; shell?: string; net?: string; container?: string; forbiddenPaths?: string[] };
+	network?: Network; // the doer's internet: off unless this says otherwise
+	networkByArm?: Record<string, Network>; // per-arm override, e.g. the same schedule for both arms, or none for control
 	doer: Role;
 	observers?: (Role & { name: string; informed?: boolean })[];
 	observerRounds?: number;
@@ -228,6 +233,19 @@ function makeEnv(workdir: string) {
 	const shell = cfg.sandbox?.shell ? at(cfg.sandbox.shell) : undefined;
 	if (cfg.sandbox?.container) process.env.RER_SANDBOX = cfg.sandbox.container;
 	return new NodeExecutionEnv({ cwd: workdir, shellPath: shell });
+}
+
+/** Switch the doer's internet with the sandbox's net script; returns the state the container reports. */
+function setNetwork(to: "on" | "off"): string {
+	const r = spawnSync(at(cfg.sandbox!.net!), [to, cfg.sandbox?.container ?? "rer-sandbox"], { encoding: "utf8" });
+	if (r.status !== 0) throw new Error(`network ${to} failed: ${r.stderr}`);
+	const actual = r.stdout.trim().split("\n").pop() ?? "unknown";
+	if (actual !== to) throw new Fatal(`asked for internet ${to}, the sandbox reports ${actual}`);
+	return actual;
+}
+async function probeInternet(workdir: string) {
+	const r: any = await makeEnv(workdir).exec("curl -sS -m 8 -o /dev/null https://example.com", {}, ctx);
+	return r.ok && r.value.exitCode === 0;
 }
 
 /** Runs through the same shell as the doer's bash. Every leak probe must fail, and the positive control must pass:
@@ -544,7 +562,7 @@ function studyFiles(): string[] {
 	Object.values(cfg.arms).forEach(add);
 	[cfg.pushes, cfg.target, cfg.doer.instructions, cfg.designer?.instructions, cfg.guessers?.prompt].forEach(add);
 	cfg.observers?.forEach((o) => add(o.instructions));
-	for (const s of [cfg.sandbox?.shell, cfg.sandbox?.start]) {
+	for (const s of [cfg.sandbox?.shell, cfg.sandbox?.start, cfg.sandbox?.net]) {
 		if (!s || !existsSync(at(s))) continue;
 		const dir = dirname(at(s));
 		for (const f of readdirSync(dir)) if (statSync(join(dir, f)).isFile()) files.add(join(dir, f)); // shell, start, Dockerfile
@@ -657,6 +675,7 @@ async function run(arm: string, runNo: string) {
 		const started = spawnSync(at(cfg.sandbox.start), [workdir, cfg.sandbox.container ?? "rer-sandbox"], { stdio: "inherit" });
 		if (started.status !== 0) throw new Error(`sandbox start failed (exit ${started.status})`);
 	}
+	if (cfg.sandbox?.net) setNetwork("off"); // isolation is always checked with the internet off
 	const iso = await canary(workdir);
 	console.log(`isolation: shell ${iso.shellWorks ? "works" : "BROKEN"}, ${JSON.stringify(iso.results)}`);
 	if (!iso.shellWorks) throw new Fatal("the doer's shell does not run in the workdir (is the sandbox container up? sandbox/start.sh <workdir>)");
@@ -672,6 +691,10 @@ async function run(arm: string, runNo: string) {
 		...(cfg.afterPath ?? []).map((pid, i) => ({ key: `open${i + 1}`, text: pick(pid), entry: { kind: "rer.push", data: { id: pid, phase: "open" } } })),
 	];
 	(cfg.autoPushes ?? []).forEach(pick);
+	const net: Network = cfg.networkByArm?.[arm] ?? cfg.network ?? {};
+	const usesNet = net.start === "on" || Object.values(net.schedule ?? {}).includes("on");
+	for (const key of Object.keys(net.schedule ?? {})) if (!plan.some((p) => p.key === key)) throw new Fatal(`network.schedule names step "${key}", which this arm does not have (${plan.map((p) => p.key).join(", ")})`);
+	Object.values(net.announce ?? {}).forEach((pid) => pid && pick(pid));
 
 	const { harness, registry } = await open(db);
 	const guardExt = guard(workdir);
@@ -702,6 +725,26 @@ async function run(arm: string, runNo: string) {
 	const inbox = at(cfg.inbox ?? `${cfg.runsDir}/inbox-${id}`);
 	mkdirSync(`${inbox}/done`, { recursive: true });
 	mkdirSync(`${inbox}/rejected`, { recursive: true });
+	// The doer's internet. Every change is recorded with who made it and whether the internet was then reachable.
+	let netState: "on" | "off" = "off";
+	const switchNetwork = async (to: "on" | "off", source: string, step?: string) => {
+		if (!cfg.sandbox?.net) throw new Fatal("network control needs sandbox.net (sandbox/net.sh)");
+		const actual = setNetwork(to);
+		const reachable = to === "on" ? (await probeInternet(workdir)) : false;
+		netState = to;
+		await write(`net:${Date.now()}`, "rer.network", { state: to, actual, reachable, source, step: step ?? null, at: new Date().toISOString() });
+		setStatus({ network: to });
+		console.log(`  internet ${to} (${source}${step ? `, before ${step}` : ""}; route ${actual}, reachable ${reachable})`);
+		notify(`${id}: internet ${to} (${source})`);
+	};
+	const announcement = (to: "on" | "off") => (net.announce?.[to] ? pick(net.announce[to]!) : undefined);
+	{
+		// Resume where the record says the internet was; a fresh run starts as configured.
+		const last = [...(await entries(doer))].reverse().find((e) => e.kind === "rer.network");
+		const restore = (last?.data as any)?.state ?? net.start ?? "off";
+		if (restore === "on" || usesNet) await switchNetwork(restore, last ? "resume" : "start");
+	}
+
 	// Inbox: files in the inbox go to the doer; files in inbox/observer-<name>/ go to that observer.
 	const isFile = (p: string) => statSync(p).isFile();
 	const pending = (dir: string) => (existsSync(dir) ? readdirSync(dir).filter((f) => !f.startsWith(".") && isFile(join(dir, f))).sort() : []);
@@ -710,6 +753,23 @@ async function run(arm: string, runNo: string) {
 	const pollInbox = async () => {
 		for (const f of pending(inbox)) {
 			const raw = readFileSync(join(inbox, f), "utf8").trim();
+			const n = raw.match(/^@net\s+(on|off)\b/);
+			if (n) {
+				const to = n[1] as "on" | "off";
+				if (!cfg.sandbox?.net) {
+					renameSync(join(inbox, f), join(inbox, "rejected", f));
+					console.error(`  ${f}: no sandbox.net configured, cannot switch the internet`);
+					continue;
+				}
+				// A person chose the timing, so it is an intervention; the announcement text itself is frozen.
+				await switchNetwork(to, "human");
+				const text = announcement(to);
+				const data = { type: "network", state: to, file: f, announced: !!text };
+				if (text) await doer.submit({ type: "input", content: text, whenBusy: "steer", requestId: `int:${f}`, entry: { kind: "rer.intervention", data } } as any, ctx);
+				else await write(`int:${f}`, "rer.intervention", data);
+				renameSync(join(inbox, f), join(inbox, "done", f));
+				continue;
+			}
 			const m = raw.match(/^@push\s+(\S+)/);
 			if (m && !pushes[m[1]]) {
 				renameSync(join(inbox, f), join(inbox, "rejected", f));
@@ -762,7 +822,14 @@ async function run(arm: string, runNo: string) {
 			setStatus({ phase: "doer", step: i + 1, of: plan.length, key: step.key });
 			await budget();
 			await pollInbox(); // also between steps, not only while the doer is busy
-			await ask(doer, step.key, step.text, step.entry ? { entry: step.entry } : {}, async () => (await pollInbox(), await budget()));
+			const scheduled = net.schedule?.[step.key];
+			let text = step.text;
+			if (scheduled && scheduled !== netState) {
+				await switchNetwork(scheduled, "schedule", step.key);
+				const said = announcement(scheduled);
+				if (said) text = `${said}\n\n${step.text}`;
+			}
+			await ask(doer, step.key, text, step.entry ? { entry: step.entry } : {}, async () => (await pollInbox(), await budget()));
 			for (const [j, pid] of (cfg.autoPushes ?? []).entries())
 				await ask(doer, `${step.key}:push${j}`, pick(pid), { entry: { kind: "rer.push", data: { id: pid, auto: true } } }, async () => (await pollInbox(), await budget()));
 			await write(`mark:${step.key}`, "rer.step", { key: step.key, index: i });
