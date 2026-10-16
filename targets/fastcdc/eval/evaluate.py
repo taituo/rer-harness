@@ -20,7 +20,10 @@ import hashlib, json, os, random, subprocess, sys, time
 
 WORK = sys.argv[1]
 HERE = os.path.dirname(os.path.abspath(__file__))
-SEED = json.load(open(os.path.join(HERE, "private-seeds.json")))["seed"]
+# The real study uses private-seeds.local.json, made on your machine and never committed (see README); `freeze` hashes
+# it, so the committed freeze file pre-registers the seed without revealing it. The committed file is for CI only.
+_local = os.path.join(HERE, "private-seeds.local.json")
+SEED = json.load(open(_local if os.path.exists(_local) else os.path.join(HERE, "private-seeds.json")))["seed"]
 TIMEOUT = 60
 SIZE = 384 * 1024
 

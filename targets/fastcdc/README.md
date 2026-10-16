@@ -15,6 +15,14 @@ The first target from [docs/targets.md](../../docs/targets.md): source-informed,
 
 The `deliver` push asks every arm, at the end, for `./split FILE` (or `split.py` / `split.sh`), printing piece lengths. It names the interface, never the method, so the tests have something to call without telling anyone how to pass them.
 
+**Before a real study, make your own private seed.** The committed seed is public and only for CI:
+
+```bash
+python3 -c "import secrets,json; print(json.dumps({'seed': secrets.randbits(48)}))" > targets/fastcdc/eval/private-seeds.local.json
+```
+
+It is git-ignored. `freeze` hashes it, so the committed freeze file pre-registers the seed without revealing it. Keep a private copy, because the hash is only checkable against the original.
+
 ```bash
 targets/fastcdc/selftest.sh                                   # the evaluator must tell good from fixed from broken
 node rer.ts models targets/fastcdc/experiment.json
