@@ -27,7 +27,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { calculateCost } from "@earendil-works/pi-ai/models";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { configure, createRegistry, defineDoc, defineExtension, defineTool, Harness, hook, ToolTask, watchEvents } from "@earendil-works/pi-durable";
+import { configure, createRegistry, defineDoc, defineExtension, defineTool, GenerationTask, Harness, hook, ToolTask, watchEvents } from "@earendil-works/pi-durable";
 import type { Conversation, EntryRecord, Submission } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -209,10 +209,15 @@ if (faux) {
 	const respond = (context: any) => {
 		const msgs = context.messages ?? [];
 		const last = msgs[msgs.length - 1];
+		// faux-only: behave like a strict OpenAI endpoint and reject duplicate tool result ids
+		const resultIds = msgs.filter((m: any) => m.role === "toolResult").map((m: any) => m.toolCallId);
+		if (new Set(resultIds).size !== resultIds.length) console.error(`[faux] DUPLICATE tool result ids in request: ${resultIds.join(",")}`);
 		const lastUser = [...msgs].reverse().find((m: any) => m.role === "user");
 		const said = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
 		const system = JSON.stringify(msgs.filter((m: any) => m.role === "system"));
 		const tools: string[] = msgs.flatMap((m: any) => (m.role === "system" ? (m.toolsAdded ?? []).map((t: any) => t.name ?? t) : []));
+		if (process.env.RER_FAUX_FAIL_OBSERVERS && tools.includes("transcript"))
+			return fauxAssistantMessage([], { stopReason: "error", errorMessage: "400 Duplicate function_call_output (faux)" });
 		if (tools.length && last?.role === "user") {
 			// faux-only: RER_FAUX_TOOLS='[["bash",{...}],["read",{...}]]' plays these calls in order, to attack the sandbox
 			const script = process.env.RER_FAUX_TOOLS ? (JSON.parse(process.env.RER_FAUX_TOOLS) as [string, any][]) : undefined;
@@ -220,6 +225,9 @@ if (faux) {
 			const call: [string, any] = tools.includes("bash")
 				? (script ? script[n++ % script.length] : ["bash", { command: `echo step ${++n} && pwd && ls` }])
 				: tools.includes("transcript") ? observerCalls[n++ % observerCalls.length] : [tools[0], {}];
+			// faux-only: RER_FAUX_DUP_IDS=1 makes observers emit two parallel calls sharing one id, as some models do
+			if (process.env.RER_FAUX_DUP_IDS && !tools.includes("bash"))
+				return fauxAssistantMessage([fauxToolCall("transcript", { count: 1 }, { id: `dup${n}` }), fauxToolCall("files", {}, { id: `dup${n}` })], { stopReason: "toolUse" });
 			return fauxAssistantMessage(fauxToolCall(call[0], call[1]), { stopReason: "toolUse" });
 		}
 		// A role asked for JSON gets the template from its instructions back, numbers filled in, so scoring pipelines run.
@@ -372,6 +380,45 @@ async function canary(workdir: string) {
 
 // ---------- harness ----------
 
+/** Some models give two parallel tool calls the same id. Pi then sends two results with that id, and strict
+ *  OpenAI-compatible endpoints reject the request ("Duplicate function_call_output", issue #3). Before every request,
+ *  give each repeated id a unique suffix in both the call and its matching result, in order. Only the request changes;
+ *  the stored transcript keeps what the model produced. */
+const UniqueToolIds = defineExtension({
+	name: "rer.unique-tool-ids",
+	hooks: [
+		hook(GenerationTask, {
+			beforeRequest: ({ messages }: any) => {
+				const seen = new Map<string, number>();
+				const pending = new Map<string, string[]>();
+				let changed = false;
+				const out = messages.map((m: any) => {
+					if (m.role === "assistant" && Array.isArray(m.content)) {
+						const content = m.content.map((b: any) => {
+							if (b.type !== "toolCall") return b;
+							const n = seen.get(b.id) ?? 0;
+							seen.set(b.id, n + 1);
+							const id = n ? `${b.id}__${n + 1}` : b.id;
+							pending.set(b.id, [...(pending.get(b.id) ?? []), id]);
+							if (id === b.id) return b;
+							changed = true;
+							return { ...b, id };
+						});
+						return content.some((b: any, i: number) => b !== m.content[i]) ? { ...m, content } : m;
+					}
+					if (m.role === "toolResult") {
+						const queue = pending.get(m.toolCallId);
+						const id = queue?.shift();
+						return id && id !== m.toolCallId ? { ...m, toolCallId: id } : m;
+					}
+					return m;
+				});
+				return changed ? { messages: out } : undefined;
+			},
+		}),
+	],
+});
+
 let current: Harness | undefined;
 process.on("SIGINT", async () => {
 	console.error("\ninterrupted; state is saved, rerun the same command to continue");
@@ -383,6 +430,7 @@ async function open(file: string) {
 	mkdirSync(dirname(file), { recursive: true });
 	const registry = createRegistry();
 	registry.install(CodingTools);
+	registry.install(UniqueToolIds);
 	const harness = await Harness.open(await openNodeSqliteStorage(file), {
 		models,
 		registry,
@@ -431,7 +479,7 @@ async function lookup(harness: Harness, name: string): Promise<Conversation | un
 const agentFor = (r: Role, extra?: string, ext?: any) => ({
 	model: ref(r.model),
 	thinkingLevel: (r.thinking ?? "high") as any,
-	extensions: ext ? [ext] : [],
+	extensions: ext ? [ext, UniqueToolIds] : [],
 	tools: ext ? undefined : [],
 	instructions: [instructions(r), extra].filter(Boolean).join("\n\n") || undefined,
 });
@@ -465,7 +513,7 @@ async function ask(c: Conversation, requestId: string, content: string, extra: o
 		console.error(`  ${requestId}: unanswered (${settled.reason}${settled.detail ? `: ${JSON.stringify(settled.detail).slice(0, 300)}` : ""})`);
 		if (attempt < (cfg.retries ?? 1)) await c.submit({ type: "write", requestId: `retry:${rid}`, entry: { kind: "rer.retry", data: { requestId, reason: settled.reason, detail: settled.detail ?? null } } } as any, ctx);
 	}
-	throw new Error(`${requestId} failed after retries; it will be retried on the next start`);
+	throw new Error(`${requestId} still failed after ${(cfg.retries ?? 1) + 1} attempts`);
 }
 
 async function answerText(c: Conversation, entryId: string) {
@@ -938,7 +986,7 @@ async function run(arm: string, runNo: string) {
 	const doer = await named(harness, "doer", {
 		model: ref(cfg.doer.model),
 		thinkingLevel: (cfg.doer.thinking ?? "xhigh") as any,
-		extensions: [CodingTools, guardExt, ...(libraryExt && !cfg.library!.fromStep ? [libraryExt] : [])],
+		extensions: [CodingTools, guardExt, UniqueToolIds, ...(libraryExt && !cfg.library!.fromStep ? [libraryExt] : [])],
 		instructions: instructions(cfg.doer),
 		cwd: workdir,
 	});
@@ -1143,7 +1191,18 @@ async function run(arm: string, runNo: string) {
 				for (const { o, c } of observers) {
 					const heard = said.filter((s) => o.informed || cfg.blindSeesInformed || !s.informed);
 					const discussion = heard.length ? `\n\nDiscussion so far:${heard.map((s) => `\n\n${s.name}: ${s.text}`).join("")}` : "";
-					said.push({ name: o.name, informed: !!o.informed, text: await ask(c, `obs:${step.key}:${round}`, fill(T.observerStep, { step: i + 1, digest, discussion }), {}, pollInbox) });
+					// An observer is a witness, not part of the experiment: if it fails after its retries, record that and go on.
+					let text: string;
+					try {
+						text = await ask(c, `obs:${step.key}:${round}`, fill(T.observerStep, { step: i + 1, digest, discussion }), {}, pollInbox);
+					} catch (e) {
+						if (e instanceof Fatal || e instanceof RunEnded) throw e;
+						text = "(no comment: this observer failed at this step)";
+						await write(`observer-failed:${o.name}:${step.key}:${round}`, "rer.observer-failed", { observer: o.name, step: step.key, round, error: (e as Error).message, at: new Date().toISOString() });
+						console.error(`  observer ${o.name} failed at ${step.key}: ${(e as Error).message}`);
+						notify(`${id}: observer ${o.name} failed at ${step.key}`);
+					}
+					said.push({ name: o.name, informed: !!o.informed, text });
 				}
 			notify(`${id}: step ${i + 1}/${plan.length} done`);
 		}
@@ -1213,6 +1272,7 @@ async function exportRun(arm: string, runNo: string) {
 		interventions: kinds("rer.intervention").map((e) => (e.data as any).type),
 		stalls: kinds("rer.stall").map((e) => (e.data as any).step),
 		retries: kinds("rer.retry").length,
+		observerFailures: kinds("rer.observer-failed").map((e) => `${(e.data as any).observer}@${(e.data as any).step}`),
 		restarts: Math.max(0, kinds("rer.session").length - 1),
 		network: kinds("rer.network").map((e) => ({ state: (e.data as any).state, source: (e.data as any).source, step: (e.data as any).step })),
 		library: { questions: kinds("rer.library").length, opened: (kinds("rer.library-open")[0]?.data as any)?.step ?? null },
