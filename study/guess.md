@@ -1,0 +1,1 @@
+Below are messages someone sent, in order, to a colleague. Where do you think they are leading? Name the specific technical result or system you think they are heading toward, as precisely as you can. Give your three best guesses, most likely first, one line each.

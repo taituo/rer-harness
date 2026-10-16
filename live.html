@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RER live</title>
+<style>
+  :root { --bg:#fbfaf7; --panel:#fff; --ink:#1d1d1b; --mute:#6f6d66; --line:#e6e3dc; --accent:#b4532a; --think:#5d6b7a; --tool:#2f6f5e; --mark:#f3ede2; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141413; --panel:#1c1c1a; --ink:#ecebe6; --mute:#9a988f; --line:#2e2d2a; --accent:#e08a5f; --think:#9fb0c2; --tool:#7cc4ad; --mark:#26241f; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  header { position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; flex-wrap:wrap; gap:6px 18px; align-items:baseline; }
+  header b { font-weight:600; }
+  header .k { color:var(--mute); }
+  #dot { width:8px; height:8px; border-radius:50%; background:#999; display:inline-block; margin-right:6px; }
+  #dot.on { background:#3a9a5b; }
+  main { display:grid; grid-template-columns: 2fr repeat(var(--obs,2), 1fr); gap:1px; background:var(--line); height:calc(100vh - 46px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height:auto; } section { height:70vh; } }
+  section { background:var(--panel); overflow-y:auto; padding:0 14px 40px; }
+  section h2 { position:sticky; top:0; background:var(--panel); margin:0 -14px; padding:10px 14px; font-size:13px; letter-spacing:.04em; text-transform:uppercase; color:var(--mute); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; }
+  .e { margin:12px 0; white-space:pre-wrap; word-wrap:break-word; }
+  .user { border-left:3px solid var(--accent); padding-left:10px; }
+  .think { color:var(--think); font-style:italic; font-size:13px; }
+  .think::before { content:"thinking · "; font-style:normal; opacity:.7; }
+  .tool { font:12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .tool .h { padding:5px 9px; color:var(--tool); background:var(--mark); }
+  .tool pre { margin:0; padding:7px 9px; max-height:260px; overflow:auto; white-space:pre-wrap; }
+  .tool.err .h { color:var(--accent); }
+  .mark { font-size:12px; color:var(--mute); background:var(--mark); padding:4px 8px; border-radius:4px; }
+  .mark.step { color:var(--ink); font-weight:600; }
+  .live { opacity:.85; }
+  .live::after { content:"▍"; color:var(--accent); animation: b 1s steps(1) infinite; }
+  @keyframes b { 50% { opacity:0; } }
+</style>
+</head>
+<body>
+<header>
+  <span><span id="dot"></span><b id="study">RER</b></span>
+  <span><span class="k">run</span> <b id="run">–</b></span>
+  <span><span class="k">phase</span> <b id="phase">–</b></span>
+  <span><span class="k">step</span> <b id="step">–</b></span>
+  <span><span class="k">spent</span> <b id="usd">–</b></span>
+</header>
+<main id="cols"></main>
+<script>
+const cols = {}, seen = {}, partial = {}, tools = {};
+const $ = (id) => document.getElementById(id);
+const el = (cls, text) => { const d = document.createElement("div"); d.className = "e " + cls; if (text !== undefined) d.textContent = text; return d; };
+
+function column(name) {
+  if (cols[name]) return cols[name];
+  const s = document.createElement("section");
+  s.innerHTML = `<h2><span>${name === "doer" ? "researcher" : name.replace("observer:", "observer ")}</span><span class="u"></span></h2>`;
+  $("cols").appendChild(s);
+  document.querySelector("main").style.setProperty("--obs", Math.max(1, Object.keys(cols).length));
+  seen[name] = new Set(); tools[name] = {};
+  return (cols[name] = s);
+}
+function add(name, node) {
+  const s = column(name), stick = s.scrollHeight - s.scrollTop - s.clientHeight < 80;
+  s.appendChild(node);
+  if (stick) s.scrollTop = s.scrollHeight;
+  return node;
+}
+function blocks(m) { return typeof m.content === "string" ? [{ type: "text", text: m.content }] : (m.content || []); }
+function toolNode(name, args) {
+  const t = document.createElement("div"); t.className = "e tool";
+  t.innerHTML = `<div class="h"></div><pre></pre>`;
+  t.querySelector(".h").textContent = `${name} ${args ? JSON.stringify(args).slice(0, 400) : ""}`;
+  return t;
+}
+function entry(name, e) {
+  if (seen[name].has(e.id)) return; seen[name].add(e.id);
+  if (!e.model) {
+    if (!e.kind.startsWith("rer.")) return;
+    const step = e.kind === "rer.step";
+    const label = step ? `— step ${e.data.index + 1} done (${e.data.key}) —` : `${e.kind.slice(4)} ${JSON.stringify(e.data).slice(0, 200)}`;
+    if (e.kind === "rer.session") return add(name, el("mark", `session started · isolated: ${e.data.isolation?.isolated} · frozen: ${e.data.frozen}`));
+    return add(name, el("mark" + (step ? " step" : ""), label));
+  }
+  for (const m of e.model) {
+    if (m.role === "user") add(name, el("user", (e.kind === "pi.user" ? "" : `[${e.kind.replace("rer.", "")}] `) + blocks(m).map((b) => b.text || "").join("")));
+    else if (m.role === "assistant") for (const b of blocks(m)) {
+      if (b.type === "thinking" && b.thinking) add(name, el("think", b.thinking));
+      else if (b.type === "text" && b.text?.trim()) add(name, el("", b.text));
+      else if (b.type === "toolCall" && !tools[name][b.id]) tools[name][b.id] = add(name, toolNode(b.name, b.arguments));
+    }
+    else if (m.role === "toolResult") {
+      const t = tools[name][m.toolCallId] || add(name, toolNode(m.toolName || "result"));
+      t.querySelector("pre").textContent = blocks(m).map((b) => b.text || "").join("");
+      if (m.isError) t.classList.add("err");
+    }
+  }
+}
+function handle(name, ev) {
+  switch (ev.type) {
+    case "snapshot":
+      column(name).querySelectorAll(".e").forEach((n) => n.remove()); seen[name].clear(); tools[name] = {}; partial[name] = null;
+      ev.entries.forEach((e) => entry(name, e));
+      break;
+    case "message_update": {
+      let p = partial[name];
+      if (!p) p = partial[name] = { node: add(name, el("live", "")), parts: [] };
+      for (const c of ev.changes) {
+        if (c.type === "text_delta" || c.type === "thinking_delta") p.parts[c.contentIndex] = (p.parts[c.contentIndex] || { kind: c.type.split("_")[0], s: "" }), p.parts[c.contentIndex].s += c.delta;
+        else if (c.type === "toolcall_start") p.parts[c.contentIndex] = { kind: "tool", s: `→ ${c.block.name}` };
+        else if (c.type === "text_start" || c.type === "thinking_start") p.parts[c.contentIndex] = { kind: c.type.split("_")[0], s: "" };
+      }
+      p.node.textContent = p.parts.filter(Boolean).map((x) => (x.kind === "thinking" ? "· " : "") + x.s).join("\n\n");
+      const s = cols[name]; if (s.scrollHeight - s.scrollTop - s.clientHeight < 160) s.scrollTop = s.scrollHeight;
+      break;
+    }
+    case "message_end":
+      if (partial[name]) partial[name].node.remove(), (partial[name] = null);
+      entry(name, ev.entry);
+      break;
+    case "tool_execution_start":
+      if (!tools[name][ev.toolCallId] && !ev.parentToolCallId) tools[name][ev.toolCallId] = add(name, toolNode(ev.toolName, ev.args));
+      break;
+    case "tool_execution_update": {
+      const t = tools[name][ev.toolCallId]; if (!t || !ev.output) break;
+      const pre = t.querySelector("pre");
+      if ("set" in ev.output) pre.textContent = ev.output.set;
+      else { if (ev.output.trimStart) pre.textContent = pre.textContent.slice(ev.output.trimStart); if (ev.output.append) pre.textContent += ev.output.append; }
+      pre.scrollTop = pre.scrollHeight;
+      break;
+    }
+    case "tool_execution_end": if (ev.entry) entry(name, ev.entry); break;
+    case "entry_appended": entry(name, ev.entry); break;
+    case "auto_retry_start": add(name, el("mark", `provider error, retry ${ev.attempt}: ${ev.errorMessage}`)); break;
+    case "usage_changed": {
+      const total = Object.values(ev.usage.models || {}).reduce((a, u) => a + (u.cost?.total || 0), 0);
+      column(name).querySelector(".u").textContent = `$${total.toFixed(2)}`;
+      break;
+    }
+  }
+}
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => $("dot").classList.add("on");
+  es.onerror = () => { $("dot").classList.remove("on"); es.close(); setTimeout(connect, 3000); };
+  es.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if (d.type === "status") {
+      const s = d.status; $("study").textContent = s.study; $("run").textContent = s.id || "–"; $("phase").textContent = s.phase || "–";
+      $("step").textContent = s.step ? `${s.step}/${s.of} (${s.key})` : "–"; $("usd").textContent = s.usd !== undefined ? `$${s.usd.toFixed(2)}` : "–";
+      (d.conversations || []).forEach(column);
+      return;
+    }
+    for (const ev of d.events) handle(d.conv, ev);
+  };
+}
+connect();
+</script>
+</body>
+</html>

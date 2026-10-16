@@ -1,0 +1,22 @@
+{
+  "name": "rer-harness",
+  "version": "1.0.0",
+  "description": "Reverse Eureka Reconstruction harness on Pi Durable",
+  "main": "index.js",
+  "scripts": {
+    "rer": "node rer.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@earendil-works/chord": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0"
+  },
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  }
+}

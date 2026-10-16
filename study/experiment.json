@@ -1,0 +1,92 @@
+{
+  "name": "handwired",
+  "runsDir": "../runs",
+  "arms": {
+    "rer": "questions.md",
+    "control": "control.md"
+  },
+  "pushes": "pushes.md",
+  "autoPushes": [],
+  "afterPath": [
+    "open-1",
+    "open-2",
+    "open-3"
+  ],
+  "target": "target.md",
+  "workdir": "/srv/work",
+  "sandbox": {
+    "start": "../sandbox/start.sh",
+    "shell": "../sandbox/shell.sh",
+    "container": "rer-sandbox",
+    "forbiddenPaths": []
+  },
+  "doer": {
+    "model": "anthropic/claude-opus-5-5",
+    "thinking": "xhigh",
+    "instructions": "doer.md"
+  },
+  "observers": [
+    {
+      "name": "A",
+      "model": "anthropic/claude-opus-5-5",
+      "thinking": "high",
+      "informed": true,
+      "instructions": "observer.md"
+    },
+    {
+      "name": "B",
+      "model": "openai/gpt-6-sol",
+      "thinking": "high",
+      "informed": false,
+      "instructions": "observer.md"
+    }
+  ],
+  "observerRounds": 1,
+  "designer": {
+    "model": "xai/grok-4.7",
+    "thinking": "xhigh",
+    "instructions": "designer.md"
+  },
+  "guessers": {
+    "models": [
+      "anthropic/claude-opus-5-5",
+      "openai/gpt-6-sol"
+    ],
+    "thinking": "high",
+    "cutoffs": [
+      3,
+      6,
+      9,
+      11,
+      15,
+      20
+    ],
+    "repeats": 5,
+    "prompt": "guess.md",
+    "shuffled": true
+  },
+  "budget": {
+    "maxUsd": 150
+  },
+  "retries": 2,
+  "digest": {
+    "maxToolChars": 4000,
+    "maxChars": 60000,
+    "includeThinking": false
+  },
+  "observerTools": true,
+  "auto": {
+    "runs": 3,
+    "arms": [
+      "rer",
+      "control"
+    ],
+    "guess": true,
+    "maxRestarts": 50
+  },
+  "live": {
+    "port": 7777,
+    "host": "127.0.0.1"
+  },
+  "notify": ""
+}
